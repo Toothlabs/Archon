@@ -352,6 +352,60 @@ describe('workflow-events', () => {
       });
     });
 
+    test('carries declared_fields back out; rows without it re-derive from the schema (#2453)', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            // A `workflow:` node completes under the CHILD's contract, which the parent's
+            // own definition does not state — so resume has to read it back, not re-derive it.
+            step_name: 'sub',
+            event_type: 'node_completed',
+            data: {
+              node_output: '{"green":true}',
+              structured_output: { green: true },
+              declared_fields: ['green', 'note'],
+            },
+          },
+          {
+            // The resume re-emit copies it forward for a SECOND resume.
+            step_name: 'replayed-sub',
+            event_type: 'node_skipped_prior_success',
+            data: { node_output: '{"n":1}', declared_fields: ['n'] },
+          },
+          {
+            // Pre-#2453 row: absent key, so the executor re-derives from the loaded schema.
+            step_name: 'legacy-sub',
+            event_type: 'node_completed',
+            data: { node_output: '{"green":true}', structured_output: { green: true } },
+          },
+          {
+            // Corrupt/foreign shape is not a contract: degrade to "none", never authorize
+            // field access from something no writer of ours produced.
+            step_name: 'corrupt-sub',
+            event_type: 'node_completed',
+            data: { node_output: '{}', declared_fields: ['ok', 7] },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-contracts');
+
+      expect(result.completedNodeOutputs.get('sub')).toEqual({
+        output: '{"green":true}',
+        structuredOutput: { green: true },
+        declaredFields: ['green', 'note'],
+      });
+      expect(result.completedNodeOutputs.get('replayed-sub')).toEqual({
+        output: '{"n":1}',
+        declaredFields: ['n'],
+      });
+      expect(result.completedNodeOutputs.get('legacy-sub')).toEqual({
+        output: '{"green":true}',
+        structuredOutput: { green: true },
+      });
+      expect(result.completedNodeOutputs.get('corrupt-sub')).toEqual({ output: '{}' });
+    });
+
     test('reports cache from a mixed run as a floor instead of withholding it', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([

@@ -20,7 +20,9 @@
  * model, node shape, run outcome/duration, a fixed-enum error class (never
  * raw error text), chat-turn activity (platform + provider + model + outcome),
  * aggregate usage numbers (token counts, cost USD, turn/run duration, loop
- * iterations — numeric totals only), approval decisions (approved/rejected,
+ * iterations — numeric totals only), how many sub-run boundaries declared a
+ * result contract on each side (counts only — never a schema, field name, or
+ * value), approval decisions (approved/rejected,
  * nothing else), a bare project-registration count, and deployment shape
  * (which adapters are enabled, db kind, auth mode — booleans/enums only).
  * Never sent: code, prompts, message content, conversation ids, file paths,
@@ -46,7 +48,7 @@ import { BUNDLED_IS_BINARY, BUNDLED_VERSION } from './bundled-build';
 import { createLogger } from './logger';
 
 /** Bumped when the captured property set changes (documented in README). */
-export const TELEMETRY_SCHEMA_VERSION = 6;
+export const TELEMETRY_SCHEMA_VERSION = 7;
 
 // Minimal shape of posthog-node's `fetch` option — copied from @posthog/core
 // (a transitive dep) to avoid pulling it in as a direct dependency.
@@ -655,6 +657,21 @@ export interface WorkflowCompletedProperties {
   cachePartialTokens?: true;
   /** Total loop iterations across all loop nodes in the run. */
   loopIterations?: number;
+  /**
+   * Result-contract shape at each 1:1 `workflow:` boundary the run crossed (#2453).
+   * The caller-side `output_format` on a `workflow:` node became a receiver assertion
+   * once a child can own its own contract; these counters are the evidence for deciding
+   * whether that compatibility surface still earns its keep. Counts of boundaries only —
+   * no workflow name, schema, field name, or value is ever carried.
+   */
+  /** Child declared a result contract, the caller node did not. */
+  subrunContractCalleeOnly?: number;
+  /** Legacy shape: only the caller node asserted a schema. */
+  subrunContractCallerOnly?: number;
+  /** Both sides declared. */
+  subrunContractDual?: number;
+  /** Dual, and the caller named a field the child's contract does not provide. */
+  subrunContractMismatch?: number;
 }
 
 /**
@@ -901,6 +918,18 @@ export function captureWorkflowCompleted(props: WorkflowCompletedProperties): vo
           : {}),
         ...(props.cachePartialTokens ? { cache_partial: true } : {}),
         ...(props.loopIterations !== undefined ? { loop_iterations: props.loopIterations } : {}),
+        ...(props.subrunContractCalleeOnly !== undefined
+          ? { subrun_contract_callee_only: props.subrunContractCalleeOnly }
+          : {}),
+        ...(props.subrunContractCallerOnly !== undefined
+          ? { subrun_contract_caller_only: props.subrunContractCallerOnly }
+          : {}),
+        ...(props.subrunContractDual !== undefined
+          ? { subrun_contract_dual: props.subrunContractDual }
+          : {}),
+        ...(props.subrunContractMismatch !== undefined
+          ? { subrun_contract_mismatch: props.subrunContractMismatch }
+          : {}),
       },
     });
   });

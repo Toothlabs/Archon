@@ -297,6 +297,13 @@ export type WorkflowRun = z.infer<typeof workflowRunSchema>;
  * `summary_value`  — additive sibling of `summary` (#2637): the child's terminal
  *                    structured value, stamped at completion alongside the text summary
  *                    so a parent `workflow:` node threads the logical value back.
+ * `summary_declared_fields` — additive sibling of `summary_value` (#2453): the top-level
+ *                    field names the child's selected `returns:` node declared, so a
+ *                    parent reads `$<node>.output.field` under the CHILD's contract
+ *                    instead of repeating that schema in its own `output_format`. Only
+ *                    the derived projection travels; the schema itself stays in captured
+ *                    workflow source. Absent on schemaless children and pre-#2453 rows,
+ *                    which keep today's caller-schema-or-nothing behavior.
  */
 export const SUBRUN_METADATA_KEYS = {
   parentNodeId: 'parent_node_id',
@@ -305,6 +312,7 @@ export const SUBRUN_METADATA_KEYS = {
   inputs: 'inputs',
   inputsValues: 'inputs_values',
   summaryValue: 'summary_value',
+  summaryDeclaredFields: 'summary_declared_fields',
 } as const;
 
 /** Typed view of the sub-run keys on a run's metadata; each is undefined when unset. */
@@ -314,6 +322,7 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
   fanOutItemHash: string | undefined;
   inputs: Record<string, JsonValue> | undefined;
   summaryValue: unknown;
+  summaryDeclaredFields: string[] | undefined;
 } {
   const parentNodeId = metadata?.[SUBRUN_METADATA_KEYS.parentNodeId];
   const childIndex = metadata?.[SUBRUN_METADATA_KEYS.childIndex];
@@ -335,6 +344,14 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
     rawLegacy !== undefined && Object.values(rawLegacy).every(v => typeof v === 'string')
       ? (rawLegacy as Record<string, string>)
       : undefined;
+  // A field projection is only usable as a field-access contract when it is exactly an
+  // array of strings. Anything else is corrupt or foreign metadata: degrade to
+  // "no contract" (today's behavior) rather than authorize access from a shape nobody wrote.
+  const rawDeclaredFields = metadata?.[SUBRUN_METADATA_KEYS.summaryDeclaredFields];
+  const summaryDeclaredFields =
+    Array.isArray(rawDeclaredFields) && rawDeclaredFields.every(f => typeof f === 'string')
+      ? rawDeclaredFields
+      : undefined;
   return {
     parentNodeId: typeof parentNodeId === 'string' ? parentNodeId : undefined,
     childIndex: typeof childIndex === 'number' ? childIndex : undefined,
@@ -345,6 +362,7 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
       metadata !== undefined && Object.hasOwn(metadata, SUBRUN_METADATA_KEYS.summaryValue)
         ? metadata[SUBRUN_METADATA_KEYS.summaryValue]
         : undefined,
+    summaryDeclaredFields,
   };
 }
 

@@ -369,7 +369,10 @@ class InMemoryStore implements IWorkflowStore {
   };
 
   getDagResumeSnapshot: IWorkflowStore['getDagResumeSnapshot'] = workflowRunId => {
-    const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
+    const completedNodeOutputs = new Map<
+      string,
+      { output: string; structuredOutput?: unknown; declaredFields?: readonly string[] }
+    >();
     const tokens = { input: 0, output: 0 };
     let costUsd = 0;
     for (const e of this.events) {
@@ -378,11 +381,17 @@ class InMemoryStore implements IWorkflowStore {
         (e.event_type === 'node_completed' || e.event_type === 'node_skipped_prior_success') &&
         typeof e.step_name === 'string'
       ) {
-        // Mirrors the real store (#2637): the logical value rides beside the text.
+        // Mirrors the real store (#2637): the logical value rides beside the text, and
+        // (#2453) the field contract the node completed under rides beside both.
+        const rawDeclaredFields = e.data?.declared_fields;
         completedNodeOutputs.set(e.step_name, {
           output: String(e.data?.node_output ?? ''),
           ...(e.data?.structured_output !== undefined
             ? { structuredOutput: e.data.structured_output }
+            : {}),
+          ...(Array.isArray(rawDeclaredFields) &&
+          rawDeclaredFields.every(f => typeof f === 'string')
+            ? { declaredFields: rawDeclaredFields as string[] }
             : {}),
         });
         // Mirrors the real store: a derived row (loop_group roll-up) restates usage
@@ -6231,6 +6240,392 @@ nodes:
         e.step_name === 'work'
     );
     expect(replayed?.data?.structured_output).toEqual([{ v: 'alpha' }, { v: 'beta' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2453 — the child's selected node owns the result contract. Its derived field
+// projection travels to the parent as `summary_declared_fields`, so a caller no
+// longer has to repeat the child's schema to read `$<node>.output.field`. A
+// caller `output_format` stays an optional receiver assertion: it may narrow,
+// never broaden.
+// ---------------------------------------------------------------------------
+
+describe('workflow: callee-owned result contracts (#2453)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  /** A child whose `returns:` node certifies its own two-field result (Phase 2 exec contract). */
+  async function writeContractChild(): Promise<void> {
+    await writeWorkflow(
+      'child-contract',
+      `
+name: child-contract
+description: a deterministic producer that certifies its own result
+returns: emit
+nodes:
+  - id: emit
+    bash: |
+      printf '%s' '{"green":true,"note":"ok"}'
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+        note: { type: string }
+      required: [green, note]
+`
+    );
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subcontract-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await removeTempTree(cwd);
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  it('a parent with NO caller output_format reads the child-declared field', async () => {
+    await writeContractChild();
+    await writeWorkflow(
+      'parent-no-schema',
+      `
+name: parent-no-schema
+description: reads a field the child declared, declaring nothing itself
+nodes:
+  - id: sub
+    workflow: child-contract
+  - id: read
+    bash: |
+      printf 'green=%s note=%s' $sub.output.green $sub.output.note
+    depends_on: [sub]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-no-schema'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    // The child stamped its own projection beside the value it already stamped.
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-contract');
+    expect(child?.metadata?.summary_value).toEqual({ green: true, note: 'ok' });
+    expect(child?.metadata?.summary_declared_fields).toEqual(['green', 'note']);
+    // The parent node completed under the CHILD's contract and persisted it.
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-no-schema');
+    const subCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'sub'
+    );
+    expect(subCompleted?.data?.declared_fields).toEqual(['green', 'note']);
+    const read = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'read'
+    );
+    expect(String(read?.data?.node_output)).toBe('green=true note=ok');
+  });
+
+  it('a typo in a child-declared field still fails loudly with no caller output_format', async () => {
+    await writeContractChild();
+    await writeWorkflow(
+      'parent-typo',
+      `
+name: parent-typo
+description: references a field the child never declared
+nodes:
+  - id: sub
+    workflow: child-contract
+  - id: read
+    bash: |
+      printf 'x=%s' $sub.output.greeen
+    depends_on: [sub]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-typo'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(false);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-typo');
+    const failed = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id && e.event_type === 'node_failed' && e.step_name === 'read'
+    );
+    expect(String(failed?.data?.error)).toContain(
+      "references field 'greeen', which is not declared in node 'sub's output_format schema"
+    );
+  });
+
+  it('a narrowing caller output_format still validates, and the CHILD contract authorizes fields', async () => {
+    await writeContractChild();
+    await writeWorkflow(
+      'parent-narrow',
+      `
+name: parent-narrow
+description: asserts only one of the child's fields, then reads the other
+nodes:
+  - id: sub
+    workflow: child-contract
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+  - id: read
+    bash: |
+      printf 'note=%s' $sub.output.note
+    depends_on: [sub]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-narrow'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-narrow');
+    // The caller narrowed its assertion to `green`, but field access is still the
+    // child's full contract — otherwise narrowing would silently delete `note`.
+    const read = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'read'
+    );
+    expect(String(read?.data?.node_output)).toBe('note=ok');
+    const subCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'sub'
+    );
+    expect(subCompleted?.data?.declared_fields).toEqual(['green', 'note']);
+  });
+
+  it('a broadening caller output_format fails the node, naming both contracts', async () => {
+    await writeContractChild();
+    await writeWorkflow(
+      'parent-broaden',
+      `
+name: parent-broaden
+description: invents an optional field the child does not declare
+nodes:
+  - id: sub
+    workflow: child-contract
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+        verdict: { type: string }
+      required: [green]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-broaden'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(false);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-broaden');
+    const failed = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id && e.event_type === 'node_failed' && e.step_name === 'sub'
+    );
+    const error = String(failed?.data?.error);
+    // Both sides named: the invented field, and what the sub-run actually declares.
+    expect(error).toContain("output_format declares field 'verdict'");
+    expect(error).toContain("sub-run 'child-contract' does not declare");
+    expect(error).toContain("'green', 'note'");
+    // Failed before any completion row could rehydrate an unauthorized contract.
+    expect(
+      store.events.some(
+        e =>
+          e.workflow_run_id === parent?.id &&
+          e.event_type === 'node_completed' &&
+          e.step_name === 'sub'
+      )
+    ).toBe(false);
+  });
+
+  it('a cold-resumed parent resolves child-declared fields exactly like a live one', async () => {
+    await writeContractChild();
+    await writeWorkflow(
+      'parent-resume-contract',
+      `
+name: parent-resume-contract
+description: the consumer fails once, then reads the same field after resume
+nodes:
+  - id: sub
+    workflow: child-contract
+  - id: read
+    bash: |
+      if [ -f "$STATE_DIR/read-marker" ]; then printf 'note=%s' $sub.output.note; else touch "$STATE_DIR/read-marker"; exit 1; fi
+    depends_on: [sub]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const first = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-resume-contract'),
+      'goal',
+      'conv-db'
+    );
+    expect(first.success).toBe(false);
+
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-resume-contract');
+    const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(parent!.id))!);
+    expect(hydrated).not.toBeNull();
+    // The snapshot carries the CHILD's contract; the parent's own definition never had it.
+    expect(hydrated?.priorCompletedNodes.get('sub')?.declaredFields).toEqual(['green', 'note']);
+
+    const second = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-resume-contract'),
+      'goal',
+      'conv-db',
+      { ...hydrated! }
+    );
+    expect(second.success).toBe(true);
+    const read = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'read'
+    );
+    expect(String(read?.data?.node_output)).toBe('note=ok');
+    // The prior-success re-emit carries the contract forward for the NEXT resume.
+    const replayed = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_skipped_prior_success' &&
+        e.step_name === 'sub'
+    );
+    expect(replayed?.data?.declared_fields).toEqual(['green', 'note']);
+  });
+
+  it('a schemaless child keeps the caller output_format as its field contract', async () => {
+    await writeWorkflow(
+      'child-schemaless',
+      `
+name: child-schemaless
+description: emits JSON with no declared contract
+returns: emit
+nodes:
+  - id: emit
+    bash: |
+      printf '%s' '{"green":true}'
+`
+    );
+    await writeWorkflow(
+      'parent-legacy-assert',
+      `
+name: parent-legacy-assert
+description: the pre-#2453 shape — only the caller declares a schema
+nodes:
+  - id: sub
+    workflow: child-schemaless
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+  - id: read
+    bash: |
+      printf 'green=%s' $sub.output.green
+    depends_on: [sub]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-legacy-assert'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-schemaless');
+    expect(child?.metadata?.summary_declared_fields).toBeUndefined();
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-legacy-assert');
+    const subCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'sub'
+    );
+    expect(subCompleted?.data?.declared_fields).toEqual(['green']);
+    const read = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'read'
+    );
+    expect(String(read?.data?.node_output)).toBe('green=true');
   });
 });
 

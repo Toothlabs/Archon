@@ -26,10 +26,15 @@ export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
  * `structuredOutput` is the logical value the node's `node_completed` event carried
  * under `structured_output`; absent for text-only nodes and rows persisted before
  * the key existed — those degrade to text re-parsing, the pre-#2637 behavior.
+ * `declaredFields` is the field-access contract the node completed under, from the
+ * event's `declared_fields` (#2453). Only a `workflow:` node writes it, because only
+ * it can hold a contract the parent's own definition does not state — every other
+ * producer's projection is re-derived from the loaded `output_format` on resume.
  */
 export interface PersistedNodeOutput {
   output: string;
   structuredOutput?: unknown;
+  declaredFields?: readonly string[];
 }
 
 export interface DagResumeSnapshot {

@@ -844,7 +844,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
       event => event.properties.workflow_name === 'implement'
     )?.properties;
     expect(exact).toMatchObject({
-      schema_version: 6,
+      schema_version: 7,
       tokens_in: 100,
       tokens_out: 10,
       cache_read_tokens: 70,
@@ -857,11 +857,85 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     // and bias aggregate cache figures low across installs (#2662).
     const floor = completed.find(event => event.properties.workflow_name === 'plan')?.properties;
     expect(floor).toMatchObject({
-      schema_version: 6,
+      schema_version: 7,
       cache_read_tokens: 70,
       cache_write_tokens: 0,
       cache_partial: true,
     });
+  });
+
+  test('captureWorkflowCompleted serializes sub-run contract counts and nothing else (#2453)', async () => {
+    delete process.env.ARCHON_TELEMETRY_DISABLED;
+    delete process.env.DO_NOT_TRACK;
+    delete process.env.CI;
+    delete process.env.POSTHOG_API_KEY;
+    const bodies: (string | Blob)[] = [];
+    const fetchImpl = Object.assign(
+      (_url: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
+        const body = (options as { body?: unknown } | undefined)?.body;
+        if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
+        return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
+      },
+      { preconnect: (): void => undefined }
+    );
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
+    try {
+      captureWorkflowCompleted({
+        outcome: 'completed',
+        workflowName: 'implement',
+        workflowSource: 'bundled',
+        subrunContractCalleeOnly: 2,
+        subrunContractCallerOnly: 1,
+        subrunContractDual: 3,
+        subrunContractMismatch: 1,
+      });
+      captureWorkflowCompleted({
+        outcome: 'completed',
+        workflowName: 'plan',
+        workflowSource: 'bundled',
+      });
+      await shutdownTelemetry();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+
+    const events: Array<{ event: string; properties: Record<string, unknown> }> = [];
+    for (const body of bodies) {
+      const raw =
+        typeof body === 'string'
+          ? body
+          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
+      const payload = JSON.parse(raw) as {
+        batch?: Array<{ event: string; properties: Record<string, unknown> }>;
+      };
+      events.push(...(payload.batch ?? []));
+    }
+    const completed = events.filter(event => event.event === 'workflow_completed');
+    const counted = completed.find(
+      event => event.properties.workflow_name === 'implement'
+    )?.properties;
+    expect(counted).toMatchObject({
+      subrun_contract_callee_only: 2,
+      subrun_contract_caller_only: 1,
+      subrun_contract_dual: 3,
+      subrun_contract_mismatch: 1,
+    });
+    // Counts only. No schema, field name, value, or sub-workflow identity may ride along.
+    const wire = JSON.stringify(counted);
+    for (const forbidden of ['output_format', 'declared_fields', 'properties', 'child-']) {
+      expect(wire).not.toContain(forbidden);
+    }
+    // A run with no `workflow:` boundary omits all four, so absence keeps its meaning.
+    const none = completed.find(event => event.properties.workflow_name === 'plan')?.properties;
+    expect(none).toBeDefined();
+    for (const key of [
+      'subrun_contract_callee_only',
+      'subrun_contract_caller_only',
+      'subrun_contract_dual',
+      'subrun_contract_mismatch',
+    ]) {
+      expect(none).not.toHaveProperty(key);
+    }
   });
 });
 

@@ -566,6 +566,43 @@ function buildRunUsageProps(totals: {
 }
 
 /**
+ * How often each result-contract shape crossed a 1:1 `workflow:` boundary in this run
+ * (#2453). The caller-side `output_format` on a `workflow:` node is now a receiver
+ * assertion the child's own contract can replace, and these counters are the evidence
+ * for deciding whether that compatibility surface still earns its keep. Fan-out children
+ * are deliberately excluded: their aggregate is an engine-owned array, so no field
+ * contract is at stake.
+ */
+interface SubrunContractCounts {
+  /** Child declared a contract, the caller node did not. */
+  calleeOnly: number;
+  /** Legacy shape: only the caller node asserted a schema. */
+  callerOnly: number;
+  /** Both declared. */
+  dual: number;
+  /** Dual, and the caller named a field the child's contract does not provide. */
+  mismatch: number;
+}
+
+/**
+ * Serialize the contract tallies for the terminal telemetry event, omitting every zero
+ * so absence means "this run had no such boundary" rather than "measured zero".
+ */
+function buildSubrunContractProps(counts: SubrunContractCounts): {
+  subrunContractCalleeOnly?: number;
+  subrunContractCallerOnly?: number;
+  subrunContractDual?: number;
+  subrunContractMismatch?: number;
+} {
+  return {
+    ...(counts.calleeOnly > 0 ? { subrunContractCalleeOnly: counts.calleeOnly } : {}),
+    ...(counts.callerOnly > 0 ? { subrunContractCallerOnly: counts.callerOnly } : {}),
+    ...(counts.dual > 0 ? { subrunContractDual: counts.dual } : {}),
+    ...(counts.mismatch > 0 ? { subrunContractMismatch: counts.mismatch } : {}),
+  };
+}
+
+/**
  * Failure taxonomy for the terminal telemetry event: the first failed node's
  * type and a fixed-enum error class derived from its stored error message.
  * Returns {} when nothing failed. Categorical only — the error text itself
@@ -798,6 +835,14 @@ export interface ChildWorkflowOutcome {
    * re-encoding the text. Absent for text-only children and pre-#2637 rows.
    */
   structuredOutput?: unknown;
+  /**
+   * Top-level field names the child's selected `returns:` node declared (#2453), read
+   * from `metadata.summary_declared_fields`. This is what lets a parent read
+   * `$<node>.output.field` under the CHILD's contract instead of repeating the child's
+   * schema in its own `output_format`. Absent for schemaless children and pre-#2453
+   * rows — those keep the caller-schema-or-nothing behavior.
+   */
+  declaredFields?: readonly string[];
   /** Child run's total cost, rolled up into the parent node's costUsd (D8). */
   costUsd?: number;
   tokens?: TokenUsage;
@@ -903,12 +948,16 @@ export function childOutcomeFromRun(run: WorkflowRun): ChildWorkflowOutcome {
   // Presence-keyed (#2637): `false`/`0`/`null` are legitimate structured values, so
   // reading through readSubrunMetadata's summaryValue keeps them distinguishable
   // from "not stamped".
-  const summaryValue = readSubrunMetadata(md).summaryValue;
+  const { summaryValue, summaryDeclaredFields } = readSubrunMetadata(md);
   return {
     childRunId: run.id,
     status: run.status,
     output: typeof md.summary === 'string' ? md.summary : undefined,
     ...(summaryValue !== undefined ? { structuredOutput: summaryValue } : {}),
+    // The child's own field contract (#2453) — read from the row so the synchronous
+    // path and the parent re-entry/resume path stay one source, exactly like the
+    // summary and usage above.
+    ...(summaryDeclaredFields !== undefined ? { declaredFields: summaryDeclaredFields } : {}),
     costUsd: typeof md.total_cost_usd === 'number' ? md.total_cost_usd : undefined,
     tokens,
     error: typeof md.error === 'string' ? md.error : undefined,
@@ -4744,6 +4793,10 @@ async function executeLoopGroupNode(
    *  could be omitted, silently handing the body an isolated Set and quietly undoing the
    *  de-duplication, with no compiler signal. */
   warnedProviderConflicts: Set<string>,
+  /** Shared by reference with the enclosing run for the same reason (#2453): a
+   *  `workflow:` node in a body must tally onto the run that emits the terminal
+   *  telemetry event. Also required, not optional, so it cannot be silently dropped. */
+  subrunContracts: SubrunContractCounts,
   /** Ordered enclosing loop_group frames. Required so nested artifact identity cannot
    *  silently fall back to only the immediate group. */
   enclosingLoopGroupPath: NodeArtifactLoopFrame[],
@@ -4888,17 +4941,19 @@ async function executeLoopGroupNode(
       const prior = outerNodeOutputs.get(bodyStepNamePrefix + id);
       if (!prior) continue;
       // The persisted row's dotted `<groupId>.<bodyId>` step name never matches a
-      // TOP-LEVEL node id, so the pre-population `prior` came from (dag-executor.ts
-      // ~10037-10052) always drops declaredFields for it. Re-derive it from the body
-      // node's OWN current definition — the same source the in-process per-iteration
+      // TOP-LEVEL node id, so the pre-population `prior` came from (executeDagWorkflow's
+      // resume loop) can only supply a contract the ROW itself carried — a body
+      // `workflow:` node's child-owned projection (#2453). Otherwise re-derive from the
+      // body node's OWN current definition — the same source the in-process per-iteration
       // path uses (~line 3111) — so a resumed $LOOP_PREV.<id>.output.<field> ref keeps
       // the same schema-typo strictness a live iteration has, instead of silently
       // degrading to lenient '' for a genuinely undeclared field.
       const bodyNodeDef = bodyNodesById.get(id);
       const declaredFields =
-        bodyNodeDef !== undefined && !isLoopGroupNode(bodyNodeDef)
+        ('declaredFields' in prior ? prior.declaredFields : undefined) ??
+        (bodyNodeDef !== undefined && !isLoopGroupNode(bodyNodeDef)
           ? declaredFieldsFromSchema(bodyNodeDef.output_format)
-          : undefined;
+          : undefined);
       restoredLoopPrevOutputs.set(id, {
         ...prior,
         ...(declaredFields !== undefined ? { declaredFields } : {}),
@@ -5225,6 +5280,7 @@ async function executeLoopGroupNode(
       totalCostUsd: 0,
       totalTokens: undefined,
       totalLoopIterations: 0,
+      subrunContracts,
       stepNamePrefix: bodyStepNamePrefix,
       loopGroupPath: [...enclosingLoopGroupPath, { groupId: node.id, iteration: i }],
       // Deliver this iteration's approval-gate free-text to body exec: nodes via env
@@ -7905,10 +7961,10 @@ async function executeWorkflowNode(
     }
   }
 
-  // Producer's declared field set (only when output_format declares object
-  // properties) so a downstream `$node.output.field` on a JSON-emitting child
-  // resolves declared-optional-absent → '' vs a typo → throw.
-  const declaredFields = declaredFieldsFromSchema(node.output_format);
+  // The CALLER's declared field set, from this node's own `output_format`. Since #2453
+  // it is only the fallback: a child that stamped its own contract authorizes field
+  // access, and this stands in solely for a schemaless or pre-#2453 child.
+  const callerDeclaredFields = declaredFieldsFromSchema(node.output_format);
   // Build the completed result AND write the node_completed event. Unlike
   // command/prompt/bash/script nodes (which write their own inside their executor)
   // and unlike approval nodes (written by the approve handler), the workflow node
@@ -7916,6 +7972,16 @@ async function executeWorkflowNode(
   // branch — so the resume snapshot skips a truly-finished sub-run on resume
   // but re-runs one still blocked on its child.
   const asCompleted = (outcome: ChildWorkflowOutcome): NodeExecutionResult => {
+    // Which side(s) of this boundary declared a contract (#2453). Counted before any
+    // failure arm so a broadening mismatch is measured, not lost. Counters only — the
+    // telemetry event never carries workflow names, schemas, field names, or values.
+    const childDeclaredFields = outcome.declaredFields;
+    if (node.output_format !== undefined) {
+      if (childDeclaredFields !== undefined) ctx.subrunContracts.dual++;
+      else ctx.subrunContracts.callerOnly++;
+    } else if (childDeclaredFields !== undefined) {
+      ctx.subrunContracts.calleeOnly++;
+    }
     // Declared boundary contract (#2774): when the node declares `output_format`, the
     // child's terminal value must match it — a mismatch fails the node HERE, before any
     // node_completed row exists, so resume re-runs into the same named failure instead
@@ -7964,6 +8030,25 @@ async function executeWorkflowNode(
         );
       }
     }
+    // Receiver-side narrowing only (#2453). When the child stamped its own contract, that
+    // contract owns which fields exist; the caller schema may re-check the value and may
+    // name FEWER fields, but a caller that names a field the child never declared would
+    // otherwise authorize `$node.output.<that field>` to resolve to '' forever. Fail with
+    // both sides named instead of inventing a field the sub-run cannot produce.
+    if (childDeclaredFields !== undefined && callerDeclaredFields !== undefined) {
+      const broadened = callerDeclaredFields.filter(f => !childDeclaredFields.includes(f));
+      if (broadened.length > 0) {
+        ctx.subrunContracts.mismatch++;
+        return failResult(
+          `Node '${node.id}': its output_format declares field${broadened.length > 1 ? 's' : ''} ${broadened.map(f => `'${f}'`).join(', ')}, which sub-run '${node.workflow}' does not declare in its own result contract (it declares: ${childDeclaredFields.length > 0 ? childDeclaredFields.map(f => `'${f}'`).join(', ') : 'no fields'}). A caller output_format may narrow the sub-run's contract, never broaden it — drop the extra field${broadened.length > 1 ? 's' : ''} here, or declare ${broadened.length > 1 ? 'them' : 'it'} on the node '${node.workflow}' returns.`,
+          outcome.costUsd,
+          outcome.tokens
+        );
+      }
+    }
+    // The contract this node completed under: the child's when it stamped one, otherwise
+    // the caller's assertion (a schemaless or pre-#2453 child — today's behavior).
+    const declaredFields = childDeclaredFields ?? callerDeclaredFields;
     if (outcome.output === undefined) {
       // A completed child with no non-blank terminal output threads '' into
       // $<node>.output — legal, but indistinguishable downstream from an
@@ -8000,6 +8085,10 @@ async function executeWorkflowNode(
             : schemaCompiled && certifiedLogicalValue !== outcome.output
               ? { structured_output: certifiedLogicalValue as JsonValue }
               : {}),
+          // The field contract this node completed under (#2453). Persisted because a
+          // resume cannot re-derive it: the child owns it, and a parent that declares no
+          // `output_format` at all would otherwise lose field access after a resume.
+          ...(declaredFields !== undefined ? { declared_fields: [...declaredFields] } : {}),
           ...(outcome.costUsd !== undefined ? { cost_usd: outcome.costUsd } : {}),
           // Rolled up from the child run's persisted totals, exactly like cost_usd —
           // tokens are the axis every provider reports (Codex reports no cost at all),
@@ -8035,7 +8124,7 @@ async function executeWorkflowNode(
         : schemaCompiled && certifiedLogicalValue !== outcome.output
           ? { structuredOutput: certifiedLogicalValue }
           : {}),
-      ...(declaredFields !== undefined ? { declaredFields } : {}),
+      ...(declaredFields !== undefined ? { declaredFields: [...declaredFields] } : {}),
     };
   };
 
@@ -9539,6 +9628,7 @@ async function executeComposeFanOutNode(
         totalCostUsd: 0,
         totalTokens: undefined,
         totalLoopIterations: 0,
+        subrunContracts: ctx.subrunContracts,
         stepNamePrefix: instanceStepNamePrefix,
         loopGroupPath: ctx.loopGroupPath,
       };
@@ -9913,6 +10003,13 @@ interface RunLayersContext {
   totalCostUsd: number;
   totalTokens: TokenUsage | undefined;
   totalLoopIterations: number;
+  /**
+   * Run-level `workflow:` result-contract tallies (#2453). Shared BY REFERENCE with
+   * loop_group and composed-fan-out body contexts (like `warnedProviderConflicts`), so a
+   * child spawned from inside a body still counts once on the run that owns the telemetry
+   * event — unlike the usage accumulators, which are folded back through node results.
+   */
+  subrunContracts: SubrunContractCounts;
   /** Prefix prepended to every persisted `step_name` ('' for top-level, '{groupId}.' for a loop_group body). */
   stepNamePrefix: string;
   /** Complete runtime loop_group lineage for typed body artifacts; empty at top level. */
@@ -10304,6 +10401,16 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                               structured_output: priorCompletedNodes.get(node.id)?.structuredOutput,
                             }
                           : {}),
+                        // Same reason as the logical value (#2453): this re-emit is the
+                        // NEXT resume's source, so a `workflow:` node's child-owned field
+                        // contract has to ride along or the second resume loses it.
+                        ...(priorCompletedNodes.get(node.id)?.declaredFields !== undefined
+                          ? {
+                              declared_fields: [
+                                ...(priorCompletedNodes.get(node.id)?.declaredFields ?? []),
+                              ],
+                            }
+                          : {}),
                       },
                     })
                     .catch((err: Error) => {
@@ -10679,6 +10786,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   ctx.nodeOutputs,
                   config,
                   ctx.warnedProviderConflicts,
+                  ctx.subrunContracts,
                   ctx.loopGroupPath,
                   ctx.claimedWorkPausePolicy,
                   issueContext,
@@ -11926,15 +12034,18 @@ export async function executeDagWorkflow(
       const node = nodesById.get(nodeId);
       // Nodes flagged always_run re-execute on resume — leave them for fresh output.
       if (node?.always_run) continue;
-      // Re-derive a schema-capable producer's declared field set from the loaded
-      // definition so its strict `$node.output.field` contract survives resume (#2091).
-      // A loop_group is the exception: its output_format is ignored, so it never gets
-      // declaredFields — but its persisted terminal payload (below) still rehydrates,
-      // matching fresh completion since #2637.
+      // Prefer the contract the node actually completed under (#2453) — a `workflow:`
+      // node's is the CHILD's, which this definition does not state and re-derivation
+      // would therefore lose. Otherwise re-derive a schema-capable producer's declared
+      // field set from the loaded definition so its strict `$node.output.field` contract
+      // survives resume (#2091). A loop_group is the exception: its output_format is
+      // ignored, so it never gets declaredFields — but its persisted terminal payload
+      // (below) still rehydrates, matching fresh completion since #2637.
       const declaredFields =
-        node !== undefined && !isLoopGroupNode(node)
+        prior.declaredFields ??
+        (node !== undefined && !isLoopGroupNode(node)
           ? declaredFieldsFromSchema(node.output_format)
-          : undefined;
+          : undefined);
       nodeOutputs.set(nodeId, {
         state: 'completed',
         output: prior.output,
@@ -11944,7 +12055,7 @@ export async function executeDagWorkflow(
         ...(prior.structuredOutput !== undefined
           ? { structuredOutput: prior.structuredOutput }
           : {}),
-        ...(declaredFields !== undefined ? { declaredFields } : {}),
+        ...(declaredFields !== undefined ? { declaredFields: [...declaredFields] } : {}),
       });
       prepopulatedCount++;
     }
@@ -12063,6 +12174,7 @@ export async function executeDagWorkflow(
     totalCostUsd: priorUsage?.costUsd ?? 0,
     totalTokens: priorUsage?.tokens,
     totalLoopIterations: 0,
+    subrunContracts: { calleeOnly: 0, callerOnly: 0, dual: 0, mismatch: 0 },
     stepNamePrefix: '',
     loopGroupPath: [],
   };
@@ -12272,11 +12384,16 @@ export async function executeDagWorkflow(
   // plus a fixed-enum error class derived from the stored node error. Raw
   // error text never leaves.
   const failureTaxonomy = firstFailedNodeTaxonomy(nodeOutputs, workflow.nodes);
-  const runUsageProps = buildRunUsageProps({
-    costUsd: totalCostUsd,
-    tokens: totalTokens,
-    loopIterations: totalLoopIterations,
-  });
+  const runUsageProps = {
+    ...buildRunUsageProps({
+      costUsd: totalCostUsd,
+      tokens: totalTokens,
+      loopIterations: totalLoopIterations,
+    }),
+    // Result-contract shape counters (#2453) travel with the same terminal event and the
+    // same omit-when-zero rule; they are counts of boundaries, never their content.
+    ...buildSubrunContractProps(runCtx.subrunContracts),
+  };
 
   getLog().info(
     { nodeCount: workflow.nodes.length, anyCompleted, anyFailed },
@@ -12540,6 +12657,11 @@ export async function executeDagWorkflow(
   // summary as `metadata.summary_value` so a parent `workflow:` node threads the
   // LOGICAL value back (fan-out aggregation and `.field` access keep the type).
   let terminalStructuredOutput: unknown;
+  // The selected node's declared field names (#2453) — the callee-owned half of the
+  // result contract. Stamped beside `summary_value` so the parent's `workflow:` node can
+  // authorize `$<node>.output.field` from the CHILD's schema instead of requiring the
+  // caller to repeat it. Only the projection travels; the schema stays in captured source.
+  let terminalDeclaredFields: readonly string[] | undefined;
   if (workflow.returns !== undefined && workflowRun.parent_run_id) {
     const returnsOutput = nodeOutputs.get(workflow.returns);
     const value = returnsOutput?.state === 'completed' ? returnsOutput.output : undefined;
@@ -12548,6 +12670,13 @@ export async function executeDagWorkflow(
       terminalStructuredOutput =
         returnsOutput !== undefined && 'structuredOutput' in returnsOutput
           ? returnsOutput.structuredOutput
+          : undefined;
+      // Taken from the completed node rather than re-derived from the definition: the
+      // node already resolved its own contract (a wait node's fixed schema, a resumed
+      // node's persisted projection), and re-deriving here would silently disagree.
+      terminalDeclaredFields =
+        returnsOutput !== undefined && 'declaredFields' in returnsOutput
+          ? returnsOutput.declaredFields
           : undefined;
     } else {
       getLog().warn(
@@ -12563,6 +12692,14 @@ export async function executeDagWorkflow(
       .map(n => nodeOutputs.get(n.id))
       .find(o => o?.state === 'completed' && o.output.trim().length > 0);
     terminalOutput = terminalSink?.output;
+    // The sink scan's node owns its contract exactly as a `returns:` node does. Stamping
+    // it here too keeps the two channels together: a child without `returns:` has threaded
+    // its terminal LOGICAL value to the parent since #2637, and a value whose field
+    // authorization stayed behind would read as schemaless downstream.
+    terminalDeclaredFields =
+      terminalSink !== undefined && 'declaredFields' in terminalSink
+        ? terminalSink.declaredFields
+        : undefined;
     terminalStructuredOutput =
       terminalSink !== undefined && 'structuredOutput' in terminalSink
         ? terminalSink.structuredOutput
@@ -12620,6 +12757,12 @@ export async function executeDagWorkflow(
         ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
         ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
           ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
+          : {}),
+        // `summary_declared_fields` (#2453) is the callee-owned field projection. Gated
+        // on the same terminal output as the two keys above, so a blank/incomplete
+        // `returns:` node stamps no contract at all rather than one nothing satisfies.
+        ...(workflowRun.parent_run_id && terminalOutput && terminalDeclaredFields !== undefined
+          ? { [SUBRUN_METADATA_KEYS.summaryDeclaredFields]: [...terminalDeclaredFields] }
           : {}),
       }
     ),
