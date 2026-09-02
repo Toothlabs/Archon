@@ -238,7 +238,7 @@ nodes:
 |-------|------|---------|-------------|
 | `provider` | string | inherited | Per-node provider override (any registered provider, e.g. `'claude'`, `'codex'`) |
 | `model` | string | inherited | Per-node model override |
-| `output_format` | object | — | JSON Schema for structured output. SDK-enforced on Claude/Codex/OpenCode; best-effort on Pi/Copilot (schema appended to prompt, JSON extracted + repaired). The parsed output is validated against the schema (every provider); a node that declares `output_format` but returns no schema-valid output **fails** rather than degrading silently. |
+| `output_format` | object | — | JSON Schema for structured output. SDK-enforced on Claude/Codex/OpenCode; best-effort on Pi/Copilot (schema appended to prompt, JSON extracted + repaired). The parsed output is validated against the schema (every provider); a node that declares `output_format` but returns no schema-valid output **fails** rather than degrading silently. Also valid on `bash:`/`script:` nodes, where the node's own stdout is the payload being certified — see [`output_format` for Structured JSON](#output_format-for-structured-json). |
 | `allowed_tools` | string[] | — | Whitelist of built-in tools. `[]` = no tools. All providers except Codex |
 | `denied_tools` | string[] | — | Tools to remove. Applied after `allowed_tools`. All providers except Codex |
 | `hooks` | object | — | Per-node SDK hook callbacks. Claude only. See [Hooks](/guides/hooks/) |
@@ -599,6 +599,27 @@ nodes:
 - Use `output_format` when downstream nodes need to branch on specific values via `when:`
 - **Validated + reask + fail-fast.** The parsed output is validated against your schema for *every* provider (a net for refusals / `max_tokens` truncation that bypass even SDK enforcement). On a miss, best-effort providers (Pi/Copilot) re-ask up to 3× with the schema errors appended; enforced providers fail immediately. A node that declares `output_format` but still has no schema-valid output **fails** — it no longer completes-with-prose and silently feeds `''` downstream.
 - **Field access is strict.** `$classify.output.type` resolves only when `type` is in the schema. A reference to a field **not declared** in the schema fails the consuming node (a typo no longer silently becomes `''`); a field you declared **optional** but the model omitted resolves to `''`. For schemaless `bash`/`script` nodes, a `.field` ref requires the output to be JSON containing that key — otherwise the consuming node fails, so always emit every key you reference (or use whole-text `$node.output`).
+
+#### Deterministic producers own the same contract
+
+`output_format` is not AI-only. Declare it on a `bash:` or `script:` node and that node certifies its own stdout:
+
+```yaml
+nodes:
+  - id: plan
+    script: build-plan-result
+    runtime: uv
+    output_format:
+      type: object
+      properties:
+        ready: { type: boolean }
+        units: { type: array, items: { type: object } }
+      required: [ready, units]
+```
+
+The node's stdout must parse as **one strict JSON document** and satisfy the schema. There is no code-fence stripping, no repair pass and no reask — stdout that does not match its own declaration is a bug in the script, so the node fails, naming the offending JSON path and quoting the start of stdout. On success the canonical document becomes `$plan.output`, the logical value feeds bindings and `fan_out.items`, and `$plan.output.units` is strict in exactly the same way as an AI node's field access.
+
+This is what makes a script and an agent interchangeable as the producer behind a `returns:` node: the contract belongs to whichever node produces the result, not to its kind. A `bash:`/`script:` node with **no** `output_format` is unchanged — stdout stays raw text.
 
 ### `allowed_tools` and `denied_tools` for Tool Restrictions
 
@@ -2946,7 +2967,7 @@ Before deploying a workflow:
 4. **`context: fresh`** — forces a fresh AI session for a node (works from artifacts only)
 5. **Parallel by default** — nodes in the same topological layer run concurrently
 6. **Conditional branching** — `when:` conditions and `trigger_rule` control which nodes run
-7. **`output_format`** — enforce structured JSON output from AI nodes for reliable branching
+7. **`output_format`** — enforce structured JSON output from an AI node, or from a `bash:`/`script:` node's stdout, for reliable branching
 8. **`allowed_tools` / `denied_tools`** — restrict tools per node (all providers except Codex)
 9. **`retry:`** — AI nodes auto-retry transient errors (default: 2 retries / 3 total attempts, 3 s backoff); `bash:`/`script:` retry only with an explicit `retry:` block
 10. **`hooks`** — attach SDK hook callbacks to Claude nodes for tool control and context injection

@@ -2449,6 +2449,60 @@ nodes:
       expect(warnedFields).not.toContain('provider');
     });
 
+    it('does NOT warn about output_format on bash/script nodes, and keeps it (#2453)', async () => {
+      // An exec node with a declared schema certifies its own stdout, so the field is
+      // enforced rather than warned-and-dropped — and it has to survive the transform to
+      // reach that enforcement. `mcp:` on the same node still warns: nothing else changed.
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'exec-contract.yaml'),
+        `
+name: exec-contract
+description: Deterministic producers own a result contract
+nodes:
+  - id: shell
+    bash: echo '{"ready":true}'
+    output_format:
+      type: object
+      properties:
+        ready:
+          type: boolean
+      required: [ready]
+  - id: prog
+    runtime: bun
+    script: console.log('{"ready":true}')
+    mcp: ./mcp.json
+    output_format:
+      type: object
+      properties:
+        ready:
+          type: boolean
+      required: [ready]
+`
+      );
+
+      mockLogger.warn.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+
+      const warnedFields = mockLogger.warn.mock.calls
+        .filter(call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored'))
+        .flatMap(call => (call[0] as { fields: string[] }).fields);
+      expect(warnedFields).not.toContain('output_format');
+      expect(warnedFields).toContain('mcp');
+
+      for (const node of result.workflows[0].workflow.nodes as DagNode[]) {
+        expect(isExecNode(node)).toBe(true);
+        expect(node.output_format).toEqual({
+          type: 'object',
+          properties: { ready: { type: 'boolean' } },
+          required: ['ready'],
+        });
+      }
+    });
+
     it('should NOT warn about pi: on loop nodes and should preserve it (#2133)', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
@@ -3332,6 +3386,33 @@ nodes:
     prompt: "Notify"
     depends_on: [check]
     when: "$check.output == 'ok'"
+`
+      );
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('accepts a script producer that declares a contract (#2453)', async () => {
+      // A certified exec node's whole output is its canonical JSON document — still
+      // author-controlled and exact, so the #2566 rejection has no reason to fire.
+      const result = await loadYaml(
+        'script-contract-whole-output.yaml',
+        `
+name: script-contract-whole-output
+description: Whole-output equality against a certified script producer
+nodes:
+  - id: check
+    runtime: bun
+    script: "console.log('{\\"ok\\":true}')"
+    output_format:
+      type: object
+      properties:
+        ok: { type: boolean }
+      required: [ok]
+  - id: notify
+    prompt: "Notify"
+    depends_on: [check]
+    when: "$check.output.ok == 'true'"
 `
       );
       expect(result.errors).toHaveLength(0);
@@ -8614,7 +8695,10 @@ nodes:
     );
 
     expect(error).toBeNull();
-    expect(workflow?.nodes[0].output_format).toBeDefined();
+    const annotated = (workflow?.nodes as DagNode[] | undefined)?.[0];
+    expect(annotated !== undefined && isAgentNode(annotated)).toBe(true);
+    if (annotated === undefined || !isAgentNode(annotated)) throw new Error('unreachable');
+    expect(annotated.output_format).toBeDefined();
   });
 
   it('leaves a schemaless node untouched', () => {
@@ -8630,6 +8714,9 @@ nodes:
     );
 
     expect(error).toBeNull();
-    expect(workflow?.nodes[0].output_format).toBeUndefined();
+    const schemaless = (workflow?.nodes as DagNode[] | undefined)?.[0];
+    expect(schemaless !== undefined && isExecNode(schemaless)).toBe(true);
+    if (schemaless === undefined || !isExecNode(schemaless)) throw new Error('unreachable');
+    expect(schemaless.output_format).toBeUndefined();
   });
 });

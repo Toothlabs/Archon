@@ -31189,6 +31189,275 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
   });
 });
 
+// ---------------------------------------------------------------------------
+// #2453 — a deterministic producer owns its result contract. A bash/script node
+// that declares output_format parses its stdout as strict JSON, validates it
+// through the shared ajv gate, and emits the same logical + text + declared-field
+// triple an AI producer emits. A schemaless exec node is untouched.
+// ---------------------------------------------------------------------------
+
+describe('exec result contracts (#2453)', () => {
+  let testDir: string;
+
+  type PersistedEvent = {
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  };
+
+  const RESULT = { ready: true, units: ['a', 'b'] };
+  const RESULT_SCHEMA = {
+    type: 'object',
+    properties: { ready: { type: 'boolean' }, units: { type: 'array' } },
+    required: ['ready', 'units'],
+  };
+  const RESULT_JSON = JSON.stringify(RESULT);
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-exec-contract-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    await removeTempTree(testDir);
+  });
+
+  /** Captures every consumer prompt so the downstream view of the certified value is observable. */
+  function captureConsumerPrompts(into: string[]): void {
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      into.push(prompt);
+      yield { type: 'assistant', content: 'consumer done' };
+      yield { type: 'result', sessionId: 'sid-cons' };
+    });
+  }
+
+  async function runDag(
+    workflow: WorkflowDefinition,
+    runId: string,
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>
+  ): Promise<PersistedEvent[]> {
+    const store = createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-2453',
+      testDir,
+      ready(workflow),
+      makeWorkflowRun(runId),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+  }
+
+  /** producer (bash or script, emitting `stdout`) → consumer prompt reading `refs`. */
+  function contractWorkflow(
+    producer: Record<string, unknown>,
+    refs = 'ready=[$producer.output.ready] units=[$producer.output.units] whole=[$producer.output]'
+  ): WorkflowDefinition {
+    return {
+      name: 'exec-contract',
+      description: 'a deterministic producer certifying its own result',
+      nodes: [
+        dagNodeSchema.parse({ id: 'producer', output_format: RESULT_SCHEMA, ...producer }),
+        dagNodeSchema.parse({ id: 'consumer', prompt: refs, depends_on: ['producer'] }),
+      ],
+    };
+  }
+
+  // Single-quoted so the JSON's double quotes reach printf untouched; no fixture below
+  // contains a single quote.
+  const bashEmitting = (stdout: string): Record<string, unknown> => ({
+    bash: `printf '%s' '${stdout}'`,
+  });
+  const scriptEmitting = (stdout: string): Record<string, unknown> => ({
+    runtime: 'bun',
+    script: `process.stdout.write(${JSON.stringify(stdout)});`,
+  });
+
+  const producerCompletion = (events: PersistedEvent[]): PersistedEvent | undefined =>
+    events.find(e => e.event_type === 'node_completed' && e.step_name === 'producer');
+  const producerFailure = (events: PersistedEvent[]): PersistedEvent | undefined =>
+    events.find(e => e.event_type === 'node_failed' && e.step_name === 'producer');
+
+  it.each([
+    ['bash', bashEmitting],
+    ['script', scriptEmitting],
+  ] as const)(
+    'a %s node certifies its stdout: canonical text, logical value, and strict field access',
+    async (kind, emitting) => {
+      const prompts: string[] = [];
+      captureConsumerPrompts(prompts);
+
+      // Padding whitespace proves the certified text is the canonical document, not raw stdout.
+      const events = await runDag(
+        contractWorkflow(emitting(`  ${RESULT_JSON}  `)),
+        `contract-fresh-${kind}`
+      );
+
+      const completed = producerCompletion(events);
+      expect(completed?.data?.structured_output).toEqual(RESULT);
+      expect(String(completed?.data?.node_output)).toBe(RESULT_JSON);
+      expect(prompts).toEqual([`ready=[true] units=[["a","b"]] whole=[${RESULT_JSON}]`]);
+    }
+  );
+
+  it.each([
+    ['bash', bashEmitting],
+    ['script', scriptEmitting],
+  ] as const)('a %s node emitting non-JSON stdout fails the node', async (kind, emitting) => {
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+
+    const events = await runDag(
+      contractWorkflow(emitting('not json at all')),
+      `contract-nonjson-${kind}`
+    );
+
+    const failed = producerFailure(events);
+    expect(producerCompletion(events)).toBeUndefined();
+    const error = String((failed?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain("node 'producer'");
+    expect(error).toContain('must be a single JSON document');
+    expect(error).toContain('not json at all');
+    // The consumer depends on a failed producer, so it never runs.
+    expect(prompts).toEqual([]);
+  });
+
+  it.each([
+    ['bash', bashEmitting],
+    ['script', scriptEmitting],
+  ] as const)('a %s node whose JSON misses the schema fails the node', async (kind, emitting) => {
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+
+    const events = await runDag(
+      contractWorkflow(emitting('{"ready":"yes"}')),
+      `contract-mismatch-${kind}`
+    );
+
+    expect(producerCompletion(events)).toBeUndefined();
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('did not satisfy its declared output_format');
+    // Both ajv failures are named: the wrong type AND the missing required field.
+    expect(error).toContain('/ready');
+    expect(error).toContain('units');
+    expect(prompts).toEqual([]);
+  });
+
+  it('a stdout excerpt that mentions a timeout is still reported as a contract failure', async () => {
+    // The exec catch reads `err.message.includes('timed out')` to detect a killed
+    // subprocess; a contract failure quotes stdout back, so it must not be misread.
+    const events = await runDag(
+      contractWorkflow(bashEmitting('the job timed out')),
+      'contract-timeout-lookalike'
+    );
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('must be a single JSON document');
+    expect(error).not.toContain('timed out after');
+  });
+
+  it('a certified exec value survives cold resume identically', async () => {
+    const freshPrompts: string[] = [];
+    captureConsumerPrompts(freshPrompts);
+    const fresh = await runDag(
+      contractWorkflow(bashEmitting(RESULT_JSON)),
+      'contract-resume-fresh'
+    );
+    const completed = producerCompletion(fresh);
+
+    const resumedPrompts: string[] = [];
+    captureConsumerPrompts(resumedPrompts);
+    const resumed = await runDag(
+      contractWorkflow(bashEmitting(RESULT_JSON)),
+      'contract-resume-resumed',
+      new Map<string, PersistedNodeOutput>([
+        [
+          'producer',
+          {
+            output: String(completed?.data?.node_output),
+            structuredOutput: completed?.data?.structured_output,
+          },
+        ],
+      ])
+    );
+
+    expect(resumedPrompts).toEqual(freshPrompts);
+    // The re-emit copies the logical value forward so a SECOND resume still sees it.
+    const replayed = resumed.find(e => e.event_type === 'node_skipped_prior_success');
+    expect(replayed?.data?.structured_output).toEqual(RESULT);
+  });
+
+  it('a resumed contracted producer still rejects a field it never declared', async () => {
+    // declaredFields is re-derived from the loaded definition on resume, so the typo
+    // strictness a live run has must not degrade to the lenient schemaless branch.
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+    const events = await runDag(
+      contractWorkflow(bashEmitting(RESULT_JSON), 'typo=[$producer.output.redy]'),
+      'contract-resume-typo',
+      new Map<string, PersistedNodeOutput>([
+        ['producer', { output: RESULT_JSON, structuredOutput: RESULT }],
+      ])
+    );
+
+    const consumerFailed = events.find(
+      e => e.event_type === 'node_failed' && e.step_name === 'consumer'
+    );
+    expect(String((consumerFailed?.data as { error?: string } | undefined)?.error)).toContain(
+      'redy'
+    );
+    expect(prompts).toEqual([]);
+  });
+
+  it('a schemaless exec node still returns raw text and persists no logical value', async () => {
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+
+    const events = await runDag(
+      {
+        name: 'exec-schemaless',
+        description: 'no declared contract, byte-identical behavior',
+        nodes: [
+          dagNodeSchema.parse({ id: 'producer', bash: "printf '%s' '  not json  '" }),
+          dagNodeSchema.parse({
+            id: 'consumer',
+            prompt: 'raw=[$producer.output]',
+            depends_on: ['producer'],
+          }),
+        ],
+      },
+      'contract-schemaless'
+    );
+
+    const completed = producerCompletion(events);
+    expect(completed?.data?.structured_output).toBeUndefined();
+    expect(String(completed?.data?.node_output)).toBe('  not json  ');
+    expect(prompts).toEqual(['raw=[  not json  ]']);
+  });
+});
+
 // ─── #2707 step 3: gate-terminated loop_group pause escalation ─────────────
 
 /**

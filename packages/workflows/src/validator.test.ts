@@ -1398,7 +1398,7 @@ describe('validateWorkflowResources — output_format compiles', () => {
       {
         id: 'plan',
         kind: 'agent',
-        source: { kind: 'prompt', text: 'emit the plan result' },
+        source: { kind: 'inline', prompt: 'emit the plan result' },
         output_format: { type: 'object', properties: { ready: { $ref: '#/$defs/missing' } } },
       } as DagNode,
     ]);
@@ -1416,7 +1416,7 @@ describe('validateWorkflowResources — output_format compiles', () => {
       {
         id: 'plan',
         kind: 'agent',
-        source: { kind: 'prompt', text: 'emit the plan result' },
+        source: { kind: 'inline', prompt: 'emit the plan result' },
         output_format: {
           type: 'object',
           properties: { ready: { type: 'boolean' } },

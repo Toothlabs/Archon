@@ -13,6 +13,7 @@ import {
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
+  GATE_AND_HALT_IGNORED_FIELDS,
   WAIT_NODE_IGNORED_FIELDS,
   WORKFLOW_NODE_IGNORED_FIELDS,
   BASH_NODE_AI_FIELDS,
@@ -1005,7 +1006,6 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
       'provider',
       'model',
       'context',
-      'output_format',
       'allowed_tools',
       'denied_tools',
       'hooks',
@@ -1021,6 +1021,47 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
     ];
     for (const field of expectedFields) {
       expect(SCRIPT_NODE_AI_FIELDS).toContain(field);
+    }
+  });
+
+  // #2453: the one AI field an exec node now OWNS. It is enforced against the node's
+  // stdout, so warning that it is ignored would be a lie — and it must stay listed on
+  // every node kind derived from this list that still has no execution site for it.
+  test('excludes output_format, which exec nodes now enforce (#2453)', () => {
+    expect(BASH_NODE_AI_FIELDS).not.toContain('output_format');
+    expect(SCRIPT_NODE_AI_FIELDS).not.toContain('output_format');
+    for (const list of [
+      GATE_AND_HALT_IGNORED_FIELDS,
+      INCLUDE_NODE_IGNORED_FIELDS,
+      WAIT_NODE_IGNORED_FIELDS,
+    ]) {
+      for (const field of BASH_NODE_AI_FIELDS) expect(list).toContain(field);
+    }
+    // Re-added where the field stays meaningless…
+    expect(GATE_AND_HALT_IGNORED_FIELDS).toContain('output_format');
+    expect(LOOP_GROUP_NODE_AI_FIELDS).toContain('output_format');
+    expect(INCLUDE_NODE_IGNORED_FIELDS).toContain('output_format');
+    // …but NOT on a wait, whose schema rejects the field outright rather than warning.
+    expect(WAIT_NODE_IGNORED_FIELDS).not.toContain('output_format');
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'w',
+        wait: { duration_ms: 5000 },
+        output_format: { type: 'object' },
+      }).success
+    ).toBe(false);
+  });
+
+  test('an exec node KEEPS output_format through the transform (#2453)', () => {
+    const outputFormat = { type: 'object', properties: { ready: { type: 'boolean' } } };
+    for (const body of [
+      { bash: 'echo hi' },
+      { script: 'console.log("hi")', runtime: 'bun' },
+    ] as const) {
+      const result = dagNodeSchema.safeParse({ id: 'n', ...body, output_format: outputFormat });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error('unreachable: asserted above');
+      expect((result.data as { output_format?: unknown }).output_format).toEqual(outputFormat);
     }
   });
 });
