@@ -25,6 +25,9 @@ import {
   type ClaudeBinaryResolution,
 } from '@archon/providers/claude/binary-resolver';
 import type { Codebase, MergedConfig, SchemaVersionInfo } from '@archon/core';
+// Type-only: does not pull ./auth (and with it the @archon/core graph) into
+// doctor's module load, which the lazy dep loaders below exist to avoid.
+import type { CliIdentityResolution } from './auth';
 
 // Vendor-canonical credential id for Codex (since #1955 credentials are keyed
 // by vendor, not agent). A connected `openai` key signals Codex intent even
@@ -235,16 +238,23 @@ async function defaultLoadCodexBinaryDeps(env: NodeJS.ProcessEnv): Promise<Codex
   // Lazy imports so doctor doesn't pull the full @archon/core graph for an
   // unrelated check (matches defaultLoadDatabaseDeps / defaultLoadProviderDeps).
   const { loadConfig, listUserProviderKeys } = await import('@archon/core');
-  const userDb = await import('@archon/core/db/users');
+  // Same lazy-import rule as the modules above; ./auth pulls @archon/core, which
+  // this loader has already paid for by here.
+  const { resolveCliIdentity } = await import('./auth');
   const config = await loadConfig(process.cwd());
 
   let credentialConnected = false;
   const cliId = env.ARCHON_USER_ID || env.USER || env.USERNAME;
   if (cliId) {
     try {
-      const user = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-      const rows = await listUserProviderKeys(user.id);
-      credentialConnected = rows.some(r => r.provider === CODEX_CREDENTIAL_VENDOR);
+      // Diagnostics must not bind: minting a user here would hold this CLI name
+      // against the console claim (#3135), and doctor is often the first command
+      // an operator runs on a fresh install.
+      const identity = await resolveCliIdentity();
+      if (identity.kind === 'resolved') {
+        const rows = await listUserProviderKeys(identity.userId);
+        credentialConnected = rows.some(r => r.provider === CODEX_CREDENTIAL_VENDOR);
+      }
     } catch (err) {
       // Credential lookup is best-effort — a DB hiccup shouldn't force the
       // binary check to run or skip; treat as "no credential connected".
@@ -546,13 +556,12 @@ export interface ProviderDeps {
   listUserProviderKeys: (
     userId: string
   ) => Promise<{ provider: string; kind: string; label: string | null }[]>;
-  // `platform` is the literal 'cli' — this check resolves the CLI identity only,
-  // and narrowing it keeps the real (platform-union-typed) db fn assignable here.
-  findOrCreateUserByPlatformIdentity: (
-    platform: 'cli',
-    id: string,
-    name: string
-  ) => Promise<{ id: string }>;
+  /**
+   * The shared CLI identity resolution from ./auth. Injected rather than called
+   * directly so this check stays testable without the dynamic import, and so the
+   * enforcement rule (find-only, never mint) has exactly one definition.
+   */
+  resolveCliIdentity: () => Promise<CliIdentityResolution>;
 }
 
 /**
@@ -582,8 +591,17 @@ export async function checkConnectedProviders(
     };
   }
   try {
-    const user = await deps.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-    const rows = await deps.listUserProviderKeys(user.id);
+    const identity = await deps.resolveCliIdentity();
+    // Under ownership enforcement an unclaimed identity has no user and no
+    // credentials, and diagnostics must not create one to find that out.
+    if (identity.kind !== 'resolved') {
+      return {
+        label,
+        status: 'skip',
+        message: `'${cliId}' is not linked to an Archon user — claim it in the console (Settings → CLI Identity)`,
+      };
+    }
+    const rows = await deps.listUserProviderKeys(identity.userId);
     if (rows.length === 0) {
       return {
         label,
@@ -605,11 +623,8 @@ export async function checkConnectedProviders(
 async function defaultLoadProviderDeps(): Promise<ProviderDeps> {
   // Lazy imports for the same reason as defaultLoadDatabaseDeps.
   const { listUserProviderKeys } = await import('@archon/core');
-  const userDb = await import('@archon/core/db/users');
-  return {
-    listUserProviderKeys,
-    findOrCreateUserByPlatformIdentity: userDb.findOrCreateUserByPlatformIdentity,
-  };
+  const { resolveCliIdentity } = await import('./auth');
+  return { listUserProviderKeys, resolveCliIdentity };
 }
 
 export async function checkWorkspaceWritable(): Promise<CheckResult> {

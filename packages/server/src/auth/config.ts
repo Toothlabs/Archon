@@ -13,18 +13,19 @@
  *
  * These helpers are intentionally pure (no Better Auth / pg imports) so they can
  * be unit-tested without constructing a database-backed auth instance.
+ *
+ * `isWebAuthEnabled` and `isConversationOwnershipEnforced` live in
+ * `@archon/core/auth/config` because the CLI needs the same answer (an unlinked
+ * shell identity must not mint its own Archon user under enforcement, #3135).
+ * They are re-exported here so every existing server caller — and the
+ * `mock.module('../auth', …)` route tests — keep one import site.
  */
+import { isWebAuthEnabled, isConversationOwnershipEnforced } from '@archon/core/auth/config';
+
+export { isWebAuthEnabled, isConversationOwnershipEnforced };
 
 /** Minimum length for BETTER_AUTH_SECRET (matches `openssl rand -base64 32`). */
 export const MIN_BETTER_AUTH_SECRET_LENGTH = 32;
-
-/**
- * Web auth is active only when a Postgres connection AND a signing secret are
- * configured. SQLite installs (no DATABASE_URL) are always opted out.
- */
-export function isWebAuthEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return Boolean(env.DATABASE_URL && env.BETTER_AUTH_SECRET);
-}
 
 /**
  * Fail fast at server boot: when web auth is enabled, the signing secret must be
@@ -93,24 +94,6 @@ export function getSignupMode(
  */
 export function isApiGateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isWebAuthEnabled(env) && env.ARCHON_WEB_AUTH_REQUIRED !== 'false';
-}
-
-/**
- * Whether operator conversations are private to their owning user (#3135).
- *
- * True on any install where identity actually arrives: Better Auth configured,
- * or a reverse proxy explicitly supplying it through `ARCHON_WEB_AUTH_HEADER`.
- * That second door matters — a proxy-authenticated install has real distinct
- * users but no Better Auth, and `isApiGateEnabled` is additionally off there
- * whenever the proxy owns admission (`ARCHON_WEB_AUTH_REQUIRED=false`).
- *
- * Keys on the variable being SET, not on the default header name, which is
- * honored even when unset — an operator setting it is the multi-user signal.
- * False on solo/SQLite installs (no Postgres, no header): nothing is owned, so
- * nothing is refused and today's open behavior is correct.
- */
-export function isConversationOwnershipEnforced(env: NodeJS.ProcessEnv = process.env): boolean {
-  return isWebAuthEnabled(env) || Boolean(env.ARCHON_WEB_AUTH_HEADER);
 }
 
 /**

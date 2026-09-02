@@ -1,6 +1,11 @@
+/**
+ * `isWebAuthEnabled` and `isConversationOwnershipEnforced` are defined in
+ * `@archon/core/auth/config` (the CLI needs them too) and their env matrices
+ * live in `packages/core/src/auth/config.test.ts`. What is tested here is what
+ * the server adds on top of them.
+ */
 import { describe, test, expect } from 'bun:test';
 import {
-  isWebAuthEnabled,
   assertWebAuthAtBoot,
   parseAllowedEmails,
   isEmailAllowed,
@@ -14,26 +19,6 @@ const VALID_SECRET = 'a'.repeat(32);
 const PG_URL = 'postgresql://postgres:postgres@localhost:5432/db';
 
 describe('auth/config', () => {
-  describe('isWebAuthEnabled', () => {
-    test('true only when both DATABASE_URL and BETTER_AUTH_SECRET are set', () => {
-      expect(isWebAuthEnabled({ DATABASE_URL: PG_URL, BETTER_AUTH_SECRET: VALID_SECRET })).toBe(
-        true
-      );
-    });
-
-    test('false when DATABASE_URL is missing (SQLite/solo install)', () => {
-      expect(isWebAuthEnabled({ BETTER_AUTH_SECRET: VALID_SECRET })).toBe(false);
-    });
-
-    test('false when BETTER_AUTH_SECRET is missing', () => {
-      expect(isWebAuthEnabled({ DATABASE_URL: PG_URL })).toBe(false);
-    });
-
-    test('false when both are missing', () => {
-      expect(isWebAuthEnabled({})).toBe(false);
-    });
-  });
-
   describe('assertWebAuthAtBoot', () => {
     test('no-op when web auth is disabled, even with a short secret', () => {
       expect(() => assertWebAuthAtBoot({ BETTER_AUTH_SECRET: 'short' })).not.toThrow();
@@ -121,23 +106,12 @@ describe('auth/config', () => {
     });
   });
 
-  describe('isConversationOwnershipEnforced', () => {
-    test('true when web auth is enabled', () => {
-      expect(
-        isConversationOwnershipEnforced({ DATABASE_URL: PG_URL, BETTER_AUTH_SECRET: VALID_SECRET })
-      ).toBe(true);
-    });
-
-    // The proxy-header install has real distinct users and no Better Auth.
-    test('true when only ARCHON_WEB_AUTH_HEADER is set (proxy-authenticated install)', () => {
-      expect(isConversationOwnershipEnforced({ ARCHON_WEB_AUTH_HEADER: 'X-Archon-User' })).toBe(
-        true
-      );
-    });
-
-    // Unlike the API gate, opting out of server-side admission does not opt out
-    // of privacy: a proxy owning admission still has distinct users.
-    test('true with web auth even when ARCHON_WEB_AUTH_REQUIRED=false', () => {
+  // The re-export is load-bearing: every server caller and every
+  // `mock.module('../auth', …)` route test imports the predicate from here.
+  describe('isConversationOwnershipEnforced (re-exported from core)', () => {
+    // Admission and privacy diverge deliberately: an install where a proxy owns
+    // admission still has real distinct users, so it still enforces ownership.
+    test('true with web auth even when the API gate is opted out', () => {
       const env = {
         DATABASE_URL: PG_URL,
         BETTER_AUTH_SECRET: VALID_SECRET,
@@ -147,14 +121,9 @@ describe('auth/config', () => {
       expect(isConversationOwnershipEnforced(env)).toBe(true);
     });
 
-    test('false on a solo/SQLite install (no Postgres, no header)', () => {
+    test('false on a solo/SQLite install, where the gate is also off', () => {
+      expect(isApiGateEnabled({})).toBe(false);
       expect(isConversationOwnershipEnforced({})).toBe(false);
-      expect(isConversationOwnershipEnforced({ DATABASE_URL: PG_URL })).toBe(false);
-    });
-
-    // Keys on the variable being SET, not on the default name being honored.
-    test('false when the header var is present but empty', () => {
-      expect(isConversationOwnershipEnforced({ ARCHON_WEB_AUTH_HEADER: '' })).toBe(false);
     });
   });
 

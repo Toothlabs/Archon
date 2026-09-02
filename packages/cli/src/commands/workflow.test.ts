@@ -231,6 +231,9 @@ mock.module('@archon/core', () => ({
 
 mock.module('@archon/core/db/users', () => ({
   findOrCreateUserByPlatformIdentity: mock(() => Promise.resolve({ id: 'user-cli-1' })),
+  // Find-only half, used by resolveCliIdentity under ownership enforcement.
+  // Defaults to "unlinked"; the enforcement tests below say otherwise per call.
+  findUserByPlatformIdentity: mock(() => Promise.resolve(null)),
 }));
 
 mock.module('@archon/core/operations/workflow-adoption', () => ({
@@ -529,11 +532,20 @@ function createDetachedChildFixture(pid: number | null = 12345): {
  * window altogether. Both suites go through here so neither can pass by accident.
  */
 /**
- * Every CLI identity source `resolveCliUserId` reads, in one place so a test can pin
- * the acting operator (or clear it entirely) without depending on the shell that runs
- * the suite.
+ * Every env key the CLI identity path reads, in one place so a test can pin the acting
+ * operator (or clear it entirely) without depending on the shell that runs the suite.
+ * The last three decide whether ownership is enforced, which is what chooses between
+ * find-or-create and find-only in `resolveCliUserRecordId` — a developer `.env` with a
+ * DATABASE_URL would otherwise flip the branch under the suite.
  */
-const CLI_IDENTITY_ENV_KEYS = ['ARCHON_USER_ID', 'USER', 'USERNAME'] as const;
+const CLI_IDENTITY_ENV_KEYS = [
+  'ARCHON_USER_ID',
+  'USER',
+  'USERNAME',
+  'DATABASE_URL',
+  'BETTER_AUTH_SECRET',
+  'ARCHON_WEB_AUTH_HEADER',
+] as const;
 
 function snapshotCliIdentityEnv(): Record<string, string | undefined> {
   return Object.fromEntries(CLI_IDENTITY_ENV_KEYS.map(key => [key, process.env[key]]));
@@ -1133,12 +1145,14 @@ describe('workflowRunCommand — dry-run', () => {
 
 describe('workflowRunCommand — requires: [github] gate', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
-  let priorArchonUserId: string | undefined;
+  let savedIdentityEnv: Record<string, string | undefined>;
 
   beforeEach(async () => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
-    // Deterministic CLI identity (resolveCliUserId reads ARCHON_USER_ID).
-    priorArchonUserId = process.env.ARCHON_USER_ID;
+    // Deterministic CLI identity, and enforcement off so the gate resolves the
+    // acting user through find-or-create (the solo-install posture).
+    savedIdentityEnv = snapshotCliIdentityEnv();
+    for (const key of CLI_IDENTITY_ENV_KEYS) delete process.env[key];
     process.env.ARCHON_USER_ID = 'cli-tester';
 
     const { executeWorkflow } = await import('@archon/workflows/executor');
@@ -1148,12 +1162,12 @@ describe('workflowRunCommand — requires: [github] gate', () => {
     (isPerUserGitHubEnabled as ReturnType<typeof mock>).mockClear();
     (getDecryptedAccessToken as ReturnType<typeof mock>).mockClear();
     (usersDb.findOrCreateUserByPlatformIdentity as ReturnType<typeof mock>).mockClear();
+    (usersDb.findUserByPlatformIdentity as ReturnType<typeof mock>).mockClear();
   });
 
   afterEach(() => {
     consoleSpy.mockRestore();
-    if (priorArchonUserId === undefined) delete process.env.ARCHON_USER_ID;
-    else process.env.ARCHON_USER_ID = priorArchonUserId;
+    restoreCliIdentityEnv(savedIdentityEnv);
   });
 
   it('blocks a requires:[github] workflow before any cost when enabled and not connected', async () => {
@@ -1303,6 +1317,33 @@ describe('workflowRunCommand — requires: [github] gate', () => {
     expect(executeWorkflow).not.toHaveBeenCalled();
   });
 
+  // #3135 Phase 6b: under enforcement the CLI never mints a user, so an unlinked
+  // identity cannot hold a GitHub connection at all. Say that, rather than the
+  // generic "connect your GitHub identity" the operator has no way to act on.
+  it('names the console claim when the acting identity is unlinked under enforcement', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { isPerUserGitHubEnabled, getDecryptedAccessToken } = await import('@archon/core');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const usersDb = await import('@archon/core/db/users');
+    process.env.ARCHON_WEB_AUTH_HEADER = 'X-Archon-User';
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'ship', requires: ['github'] }, 'project')],
+      errors: [],
+    });
+    (isPerUserGitHubEnabled as ReturnType<typeof mock>).mockReturnValueOnce(true);
+
+    await expect(
+      workflowRunCommand('/repo/root', 'ship', 'go', { noWorktree: true })
+    ).rejects.toThrow(/Settings → CLI Identity/);
+
+    // Find-only: the gate never mints the standalone user that would hold
+    // 'cli-tester' against the console claim, and never reaches the token store.
+    expect(usersDb.findUserByPlatformIdentity).toHaveBeenCalledWith('cli', 'cli-tester');
+    expect(usersDb.findOrCreateUserByPlatformIdentity).not.toHaveBeenCalled();
+    expect(getDecryptedAccessToken).not.toHaveBeenCalled();
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
   it('fails closed when the identity/token lookup throws', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     const { isPerUserGitHubEnabled } = await import('@archon/core');
@@ -1336,6 +1377,9 @@ describe('workflowRunCommand — CLI operator attribution (#3135)', () => {
   beforeEach(async () => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
     savedIdentityEnv = snapshotCliIdentityEnv();
+    // Solo-install baseline: enforcement off, so attribution goes through
+    // find-or-create. Each test then sets the identity it wants.
+    for (const key of CLI_IDENTITY_ENV_KEYS) delete process.env[key];
     const conversationsDb = await import('@archon/core/db/conversations');
     const usersDb = await import('@archon/core/db/users');
     (conversationsDb.getOrCreateConversation as ReturnType<typeof mock>).mockClear();

@@ -55,6 +55,28 @@ async function selectIdentity(
 }
 
 /**
+ * Resolve a platform-native user id to an Archon User row WITHOUT creating
+ * anything — the find-only half of findOrCreateUserByPlatformIdentity.
+ *
+ * Callers that must not mint a user use this: on an install that enforces
+ * conversation ownership (#3135), an unlinked shell identity that created its
+ * own Archon user would hold `('cli', <name>)` forever, and the console claim
+ * that identity exists for would conflict with a user nobody can sign in as.
+ *
+ * Returns null when the identity is unknown, and also for the orphan case where
+ * the identity row outlives its user — repairing that means creating a user,
+ * which is exactly what this function promises not to do.
+ */
+export async function findUserByPlatformIdentity(
+  platform: IdentityPlatform,
+  platformUserId: string
+): Promise<User | null> {
+  const identity = await selectIdentity(platform, platformUserId);
+  if (!identity) return null;
+  return await getUserById(identity.user_id);
+}
+
+/**
  * Resolve a platform-native user id to an Archon User row, creating the user
  * and the identity mapping if this is the first time we've seen them.
  *

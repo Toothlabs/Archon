@@ -948,12 +948,13 @@ describe('doctorCommand', () => {
 });
 
 describe('checkConnectedProviders', () => {
-  const mockUser = { id: 'user-1' };
+  const resolved = () =>
+    Promise.resolve({ kind: 'resolved' as const, cliId: 'testuser', userId: 'user-1' });
 
   it('returns skip when CLI identity is not resolvable', async () => {
     const result = await checkConnectedProviders({}, async () => ({
       listUserProviderKeys: async () => [],
-      findOrCreateUserByPlatformIdentity: async () => mockUser,
+      resolveCliIdentity: resolved,
     }));
     expect(result.status).toBe('skip');
     expect(result.message).toContain('no CLI identity');
@@ -962,7 +963,7 @@ describe('checkConnectedProviders', () => {
   it('returns skip with a connect hint when no providers are connected', async () => {
     const result = await checkConnectedProviders({ USER: 'testuser' }, async () => ({
       listUserProviderKeys: async () => [],
-      findOrCreateUserByPlatformIdentity: async () => mockUser,
+      resolveCliIdentity: resolved,
     }));
     expect(result.status).toBe('skip');
     expect(result.message).toContain('archon ai login');
@@ -974,7 +975,7 @@ describe('checkConnectedProviders', () => {
         { provider: 'anthropic', kind: 'oauth', label: 'subscription' },
         { provider: 'openrouter', kind: 'api_key', label: null },
       ],
-      findOrCreateUserByPlatformIdentity: async () => mockUser,
+      resolveCliIdentity: resolved,
     }));
     expect(result.status).toBe('pass');
     expect(result.message).toContain('2 connected');
@@ -994,9 +995,26 @@ describe('checkConnectedProviders', () => {
       listUserProviderKeys: async () => {
         throw new Error('db down');
       },
-      findOrCreateUserByPlatformIdentity: async () => mockUser,
+      resolveCliIdentity: resolved,
     }));
     expect(result.status).toBe('skip');
     expect(result.message).toContain('db down');
+  });
+
+  // #3135 Phase 6b: doctor is often the first command run on a fresh install, so
+  // it must report an unclaimed identity rather than mint a user to describe it.
+  it('reports an unlinked identity as a skip and never reads credentials', async () => {
+    let credentialsRead = false;
+    const result = await checkConnectedProviders({ USER: 'testuser' }, async () => ({
+      listUserProviderKeys: async () => {
+        credentialsRead = true;
+        return [];
+      },
+      resolveCliIdentity: () => Promise.resolve({ kind: 'unlinked' as const, cliId: 'testuser' }),
+    }));
+    expect(result.status).toBe('skip');
+    expect(result.message).toContain('not linked to an Archon user');
+    expect(result.message).toContain('Settings → CLI Identity');
+    expect(credentialsRead).toBe(false);
   });
 });

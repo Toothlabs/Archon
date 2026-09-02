@@ -110,8 +110,27 @@ mock.module('@archon/core', () => ({
 }));
 mock.module('@archon/core/db/users', () => ({
   findOrCreateUserByPlatformIdentity: mock(async () => ({ id: 'u1' })),
+  findUserByPlatformIdentity: mock(async () => ({ id: 'u1' })),
 }));
-mock.module('./auth', () => ({ resolveCliUserId: () => 'cli-alice' }));
+
+// The single definition of "what user is this shell?" lives in ./auth, so these
+// tests state the resolution they want rather than the env that produces it.
+// `cliIdentity` is the seam: flip it to exercise the unlinked refusal.
+let cliIdentity: {
+  kind: 'resolved' | 'unset' | 'unlinked' | 'unavailable';
+  cliId?: string;
+  userId?: string;
+  error?: Error;
+} = { kind: 'resolved', cliId: 'cli-alice', userId: 'u1' };
+
+mock.module('./auth', () => ({
+  resolveCliUserId: () => 'cli-alice',
+  resolveCliIdentity: () => Promise.resolve(cliIdentity),
+  resolveCliUserRecordId: () =>
+    Promise.resolve(cliIdentity.kind === 'resolved' ? cliIdentity.userId : undefined),
+  unlinkedCliIdentityMessage: (cliId: string) =>
+    `The CLI identity '${cliId}' is not linked to an Archon user on this install.`,
+}));
 mock.module('@archon/paths', () => ({ createLogger: noopLogger }));
 
 // @archon/providers is NOT mocked — register builtins so isRegisteredProvider()
@@ -202,6 +221,46 @@ describe('aiKeySetCommand — validation before reading the key', () => {
     expect(await aiKeySetCommand('bogus')).toBe(1);
     expect(out()).toContain("Unknown provider 'bogus'");
     expect(mockPersist).not.toHaveBeenCalled();
+  });
+});
+
+// #3135 Phase 6b: on an ownership-enforcing install the CLI never mints a user,
+// so a credential command must refuse an unlinked identity rather than store a
+// secret against a user nobody can sign in as.
+describe('credential commands — unlinked CLI identity under enforcement', () => {
+  let savedTTY: boolean | undefined;
+
+  beforeEach(() => {
+    cliIdentity = { kind: 'unlinked', cliId: 'cli-alice' };
+    const s = process.stdin as unknown as { isTTY?: boolean };
+    savedTTY = s.isTTY;
+    s.isTTY = false;
+  });
+  afterEach(() => {
+    cliIdentity = { kind: 'resolved', cliId: 'cli-alice', userId: 'u1' };
+    (process.stdin as unknown as { isTTY?: boolean }).isTTY = savedTTY;
+  });
+
+  it('refuses with the console claim and never writes, reads, or deletes', async () => {
+    const stdinSpy = spyOn(Bun.stdin, 'text').mockResolvedValue('sk-should-not-store');
+    try {
+      expect(await aiKeySetCommand('openrouter')).toBe(1);
+      expect(await aiListCommand()).toBe(1);
+      expect(await aiLogoutCommand('openrouter')).toBe(1);
+    } finally {
+      stdinSpy.mockRestore();
+    }
+    expect(out()).toContain('not linked to an Archon user');
+    expect(mockPersist).not.toHaveBeenCalled();
+    expect(mockList).not.toHaveBeenCalled();
+    expect(mockDelete).not.toHaveBeenCalled();
+  });
+
+  // The listings are reads: no identity and no linked identity are the same
+  // answer, "no per-user overrides", so they still print the install config.
+  it('still lists install config for the ungated tier view', async () => {
+    expect(await aiTierListCommand()).toBe(0);
+    expect(mockGetUserAiPrefs).not.toHaveBeenCalled();
   });
 });
 

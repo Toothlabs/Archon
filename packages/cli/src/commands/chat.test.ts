@@ -44,8 +44,20 @@ mock.module('@archon/core/db/users', () => ({
 import { chatCommand } from './chat';
 import { CLIAdapter } from '../adapters/cli-adapter';
 
-/** Every CLI identity source, saved so a test can clear them and put them back. */
-const IDENTITY_ENV_KEYS = ['ARCHON_USER_ID', 'USER', 'USERNAME'] as const;
+/**
+ * Every env key the CLI identity path reads, saved so a test can clear them and put
+ * them back. The last three decide whether ownership is enforced, which chooses
+ * between find-or-create and find-only inside `resolveCliUserRecordId`; clearing them
+ * pins this suite to the solo-install branch regardless of a developer `.env`.
+ */
+const IDENTITY_ENV_KEYS = [
+  'ARCHON_USER_ID',
+  'USER',
+  'USERNAME',
+  'DATABASE_URL',
+  'BETTER_AUTH_SECRET',
+  'ARCHON_WEB_AUTH_HEADER',
+] as const;
 
 function snapshotIdentityEnv(): Record<string, string | undefined> {
   return Object.fromEntries(IDENTITY_ENV_KEYS.map(key => [key, process.env[key]]));
@@ -66,6 +78,7 @@ describe('chatCommand', () => {
     mockHandleMessage.mockClear();
     mockFindOrCreateUser.mockClear();
     savedIdentityEnv = snapshotIdentityEnv();
+    for (const key of IDENTITY_ENV_KEYS) delete process.env[key];
     // Deterministic operator for the default case; the attribution tests below
     // override it. Without this, the result depends on the shell running tests.
     process.env.ARCHON_USER_ID = 'cli-tester';

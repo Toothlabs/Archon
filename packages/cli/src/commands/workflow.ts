@@ -139,7 +139,6 @@ import * as messageDb from '@archon/core/db/messages';
 import * as workflowDb from '@archon/core/db/workflows';
 import * as workflowEventsDb from '@archon/core/db/workflow-events';
 import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
-import * as userDb from '@archon/core/db/users';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
 import { writeJsonLine, writeStderr, writeStdout } from '../utils/stdout';
@@ -150,7 +149,7 @@ import {
   requestDetachedRunStop,
   startDetachedRunControlServer,
 } from '../utils/detached-run-control';
-import { resolveCliUserId, resolveCliUserRecordId } from './auth';
+import { resolveCliIdentity, resolveCliUserRecordId, unlinkedCliIdentityMessage } from './auth';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -864,28 +863,47 @@ async function assertCliWorkflowRequirementsMet(workflow: WorkflowDefinition): P
   // Resolve the acting CLI user (ARCHON_USER_ID, else $USER/$USERNAME) → Archon
   // user id, then check for a stored GitHub connection. An unresolvable user or
   // a lookup failure means "not connected" — fail closed, never silently allow.
-  const cliId = resolveCliUserId();
+  const identity = await resolveCliIdentity();
+
+  // An unlinked identity on an ownership-enforcing install cannot hold a GitHub
+  // connection at all, because the CLI never mints a user for it. Say that,
+  // instead of the generic "connect your GitHub identity" the operator cannot act on.
+  if (identity.kind === 'unlinked') {
+    throw new Error(
+      `Workflow '${workflow.name}' requires a connected GitHub identity.\n` +
+        unlinkedCliIdentityMessage(identity.cliId)
+    );
+  }
+
   let githubConnected = false;
-  if (cliId) {
+  if (identity.kind === 'resolved') {
     try {
-      const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-      githubConnected = Boolean(await getDecryptedAccessToken(cliUser.id));
+      githubConnected = Boolean(await getDecryptedAccessToken(identity.userId));
     } catch (error) {
-      getLog().warn({ err: error as Error, cliId }, 'cli.requirement_gate_user_resolve_failed');
+      getLog().warn(
+        { err: error as Error, cliId: identity.cliId },
+        'cli.requirement_gate_user_resolve_failed'
+      );
     }
+  } else if (identity.kind === 'unavailable') {
+    getLog().warn(
+      { err: identity.error, cliId: identity.cliId },
+      'cli.requirement_gate_user_resolve_failed'
+    );
   }
 
   assertWorkflowRequirementsMet(workflow, { githubConnected });
 }
 
 async function resolveCliDryRunAiPrefs(): Promise<Awaited<ReturnType<typeof getUserAiPrefs>>> {
-  const cliId = resolveCliUserId();
-  if (!cliId) return {};
+  // A miss — no identity set, or one no Archon user has claimed — is the same
+  // answer as "no overrides": preview against the install config.
+  const cliUserId = await resolveCliUserRecordId();
+  if (!cliUserId) return {};
   try {
-    const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-    return await getUserAiPrefs(cliUser.id);
+    return await getUserAiPrefs(cliUserId);
   } catch (error) {
-    getLog().warn({ err: error as Error, cliId }, 'cli.dry_run_user_ai_prefs_resolve_failed');
+    getLog().warn({ err: error as Error }, 'cli.dry_run_user_ai_prefs_resolve_failed');
     return {};
   }
 }

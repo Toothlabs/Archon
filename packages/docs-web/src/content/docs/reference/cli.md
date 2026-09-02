@@ -130,6 +130,19 @@ The **CLI identity** comes from `ARCHON_USER_ID`, else `$USER` / `$USERNAME`. Le
 
 On an install with [web auth](/reference/configuration/#web-ui-login-better-auth-optional), conversations you start from the CLI belong to that `cli` identity, which is a *different* Archon user from your web login. To see them in the console, open **Settings → CLI Identity** and paste the CLI identity this prints. The claim is always made from the authenticated web session, never from the CLI: a CLI-side link would let anyone with shell access attach themselves to a web account and inherit its private conversations, GitHub token, and provider credentials. Claiming an identity another Archon user already holds is refused — that user unlinks it first.
 
+Until you claim it, such an install prints `Archon user id: not linked yet` and work started here is written **unattributed**: the CLI looks the identity up but never creates an Archon user for it, because a user nobody can sign in as would hold your CLI name and make the claim conflict forever. Solo installs are unaffected — they still create and reuse the CLI user as they always have.
+
+Commands split on what an unclaimed identity means for them:
+
+| Commands | Unclaimed identity |
+| --- | --- |
+| `archon chat`, `archon workflow run`, `archon ai tier list` | Run normally, unattributed. Per-user prefs read as empty, so the install config applies. |
+| [`auth github`](#auth-github), [`ai key set` / `login` / `list` / `logout`](#ai) | Refuse with the claim instructions. A credential stored against a user nobody can sign in as is unreachable. |
+| A workflow declaring `requires: [github]` | Refuses, naming the claim — an unclaimed identity cannot hold a GitHub connection. |
+| [`doctor`](#doctor) | Reports it as a skipped check, never as a failure. |
+
+Unlinking releases the identity so it can be claimed again, by you or by a colleague. It does **not** hide conversations you already own: those carry your user id because you owned them when they were created, and unlinking only stops *future* CLI work from resolving to you.
+
 Neither id is a secret. Verification comes from holding the web session.
 
 ### `ai`

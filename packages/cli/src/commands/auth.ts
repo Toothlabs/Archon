@@ -11,6 +11,11 @@
  * CLI identity: ARCHON_USER_ID (explicit override) else $USER/$USERNAME. We
  * resolve it to a stable Archon user via the 'cli' platform identity so the
  * connected GitHub token attaches to the same user across CLI invocations.
+ *
+ * On an install that enforces conversation ownership (#3135) that resolution is
+ * find-only: minting a user for an unlinked shell identity would bind
+ * ('cli', <name>) to an account nobody can sign in as, and the console claim
+ * this whole surface exists for would then conflict forever.
  */
 import { createLogger } from '@archon/paths';
 import {
@@ -19,6 +24,7 @@ import {
   DeviceFlowError,
   GithubIdentityConflictError,
 } from '@archon/core';
+import { isConversationOwnershipEnforced } from '@archon/core/auth/config';
 import * as userDb from '@archon/core/db/users';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -35,22 +41,106 @@ export function resolveCliUserId(env: NodeJS.ProcessEnv = process.env): string |
 }
 
 /**
- * The acting CLI user's Archon id, or undefined when `ARCHON_USER_ID`/`$USER` is unset
- * or the identity cannot be resolved. Attribution is best-effort by design — a chat turn
- * or a workflow run must not fail because the user table could not be reached.
+ * What the acting shell resolved to. The three failure cases are genuinely
+ * different answers and callers act on them differently — attribution shrugs at
+ * all three, while a command that writes a credential has to refuse `unlinked`
+ * with an actionable message instead of storing it against nobody.
+ */
+export type CliIdentityResolution =
+  /** ARCHON_USER_ID / $USER / $USERNAME resolved to an Archon user. */
+  | { kind: 'resolved'; cliId: string; userId: string }
+  /** No CLI identity is set at all: this shell acts as nobody. */
+  | { kind: 'unset' }
+  /** Enforced install: the identity is real but no Archon user has claimed it. */
+  | { kind: 'unlinked'; cliId: string }
+  /** The user table could not be reached. */
+  | { kind: 'unavailable'; cliId: string; error: Error };
+
+/**
+ * The one definition of how a shell becomes an Archon user, so no caller spells
+ * the enforcement rule a second time.
  *
- * Shared by every CLI surface that stamps a row with the local operator: the chat and
- * workflow conversation rows, the workflow run row, and the persisted user message.
+ * Under conversation-ownership enforcement the lookup is find-only. Minting a
+ * user for an unlinked shell identity would bind ('cli', <name>) to an account
+ * nobody can sign in as, and the console claim would then conflict forever with
+ * a holder that has no web session to unlink from. Solo installs keep
+ * find-or-create, so per-user CLI credentials and prefs work there exactly as
+ * they do today.
+ *
+ * Never throws: a caller decides whether an unreachable user table is fatal.
+ */
+export async function resolveCliIdentity(): Promise<CliIdentityResolution> {
+  const cliId = resolveCliUserId();
+  if (!cliId) return { kind: 'unset' };
+  try {
+    const cliUser = isConversationOwnershipEnforced()
+      ? await userDb.findUserByPlatformIdentity('cli', cliId)
+      : await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+    return cliUser ? { kind: 'resolved', cliId, userId: cliUser.id } : { kind: 'unlinked', cliId };
+  } catch (error) {
+    return { kind: 'unavailable', cliId, error: error as Error };
+  }
+}
+
+/**
+ * The one message that tells an operator how to claim their CLI identity, for
+ * the commands that must refuse rather than degrade.
+ */
+export function unlinkedCliIdentityMessage(cliId: string): string {
+  return (
+    `The CLI identity '${cliId}' is not linked to an Archon user on this install.\n` +
+    "Run 'archon auth whoami', claim that identity in the console under\n" +
+    'Settings → CLI Identity, then run this again.'
+  );
+}
+
+/** CLI identities already told they are unlinked, so a process says it once. */
+const unlinkedNoticesShown = new Set<string>();
+
+/**
+ * Tell the operator once that their work will not show up in their console.
+ * A notice, not a failure: the turn or run still executes, it is just written
+ * without an owner — the same row a CLI invocation produced before attribution
+ * existed at all.
+ */
+function noticeUnlinkedCliIdentity(cliId: string): void {
+  if (unlinkedNoticesShown.has(cliId)) return;
+  unlinkedNoticesShown.add(cliId);
+  console.error(
+    `Note: the CLI identity '${cliId}' is not linked to an Archon user on this install,\n` +
+      'so work started here is unattributed and will not appear in your console.\n' +
+      "Run 'archon auth whoami', then claim that identity in the console under\n" +
+      'Settings → CLI Identity.'
+  );
+}
+
+/**
+ * The acting CLI user's Archon id, or undefined when no identity is set, none is
+ * linked, or the user table could not be reached. Attribution is best-effort by
+ * design — a chat turn or a workflow run must not fail because Archon cannot name
+ * the operator.
+ *
+ * Shared by every CLI surface that stamps a row with the local operator (the chat
+ * and workflow conversation rows, the workflow run row, the persisted user
+ * message) and by the per-user reads, where "no id" and "no overrides" are the
+ * same answer.
  */
 export async function resolveCliUserRecordId(): Promise<string | undefined> {
-  const cliId = resolveCliUserId();
-  if (!cliId) return undefined;
-  try {
-    const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-    return cliUser.id;
-  } catch (error) {
-    getLog().warn({ err: error as Error, cliId }, 'cli.user_identity_resolve_failed');
-    return undefined;
+  const identity = await resolveCliIdentity();
+  switch (identity.kind) {
+    case 'resolved':
+      return identity.userId;
+    case 'unlinked':
+      noticeUnlinkedCliIdentity(identity.cliId);
+      return undefined;
+    case 'unavailable':
+      getLog().warn(
+        { err: identity.error, cliId: identity.cliId },
+        'cli.user_identity_resolve_failed'
+      );
+      return undefined;
+    case 'unset':
+      return undefined;
   }
 }
 
@@ -62,10 +152,15 @@ export async function resolveCliUserRecordId(): Promise<string | undefined> {
  * Archon user id is the durable row both surfaces resolve to. Neither is a
  * secret — verification for a link comes from holding the web session, not from
  * knowing the CLI name.
+ *
+ * Reading must not bind. Under enforcement this reports "not linked yet" rather
+ * than creating a user, so the very command that tells you what to paste cannot
+ * be the reason pasting it fails.
  */
 export async function authWhoamiCommand(): Promise<number> {
-  const cliId = resolveCliUserId();
-  if (!cliId) {
+  const identity = await resolveCliIdentity();
+
+  if (identity.kind === 'unset') {
     console.error(
       'No CLI identity is set, so conversations and runs started here are unattributed.\n' +
         'Set ARCHON_USER_ID to a stable name (recommended — $USER is unset in many\n' +
@@ -73,22 +168,27 @@ export async function authWhoamiCommand(): Promise<number> {
     );
     return 1;
   }
-
-  let user: { id: string };
-  try {
-    user = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-  } catch (err) {
-    getLog().error({ err: err as Error, cliId }, 'cli.auth_whoami_failed');
-    console.error(`Could not resolve your CLI identity: ${(err as Error).message}`);
+  if (identity.kind === 'unavailable') {
+    getLog().error({ err: identity.error, cliId: identity.cliId }, 'cli.auth_whoami_failed');
+    console.error(`Could not resolve your CLI identity: ${identity.error.message}`);
     return 1;
   }
 
-  console.log(`CLI identity:   ${cliId}`);
-  console.log(`Archon user id: ${user.id}`);
-  console.log(
-    '\nOn an install with web auth, link this CLI identity from the console\n' +
-      '(Settings → CLI Identity) to see conversations started here in your own account.'
-  );
+  console.log(`CLI identity:   ${identity.cliId}`);
+  if (identity.kind === 'resolved') {
+    console.log(`Archon user id: ${identity.userId}`);
+    console.log(
+      '\nOn an install with web auth, link this CLI identity from the console\n' +
+        '(Settings → CLI Identity) to see conversations started here in your own account.'
+    );
+  } else {
+    console.log('Archon user id: not linked yet');
+    console.log(
+      '\nThis install keeps operator conversations private to their owner, so work\n' +
+        'started here is unattributed until you claim this identity. Paste the CLI\n' +
+        'identity above into the console under Settings → CLI Identity.'
+    );
+  }
   return 0;
 }
 
@@ -102,17 +202,25 @@ export async function authGithubCommand(): Promise<number> {
     return 1;
   }
 
-  const cliId = resolveCliUserId();
-  if (!cliId) {
+  const identity = await resolveCliIdentity();
+  if (identity.kind === 'unset') {
     console.error('Could not determine your CLI identity. Set ARCHON_USER_ID (or $USER).');
     return 1;
   }
-
-  const user = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-  console.log(`Opening device flow for user_id: ${cliId}`);
+  // A user-table failure is fatal here rather than best-effort: the device flow
+  // has nothing to attach its tokens to. Surfaced by cli.ts as it was before.
+  if (identity.kind === 'unavailable') throw identity.error;
+  // Refuse rather than degrade: connecting stores a credential against a user,
+  // and minting one for an unlinked identity would attach this GitHub account to
+  // a user nobody can sign in as — and block the console claim afterwards.
+  if (identity.kind === 'unlinked') {
+    console.error(unlinkedCliIdentityMessage(identity.cliId));
+    return 1;
+  }
+  console.log(`Opening device flow for user_id: ${identity.cliId}`);
 
   try {
-    const result = await connectGithubForUser(user.id, info => {
+    const result = await connectGithubForUser(identity.userId, info => {
       console.log(`\n→ Visit ${info.verification_uri} and enter code: ${info.user_code}`);
       console.log('→ Waiting for authorization…');
     });

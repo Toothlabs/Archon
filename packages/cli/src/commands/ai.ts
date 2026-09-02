@@ -59,8 +59,7 @@ import {
   validEffortsForProvider,
 } from '@archon/workflows/model-validation';
 import type { TierName, RawAliasEntry } from '@archon/workflows/model-validation';
-import * as userDb from '@archon/core/db/users';
-import { resolveCliUserId } from './auth';
+import { resolveCliIdentity, resolveCliUserRecordId, unlinkedCliIdentityMessage } from './auth';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -98,19 +97,29 @@ function ensureEnabled(): boolean {
   return true;
 }
 
-/** Resolve the CLI identity to an Archon user row, or print why we can't. */
+/**
+ * Resolve the CLI identity to an Archon user row, or print why we can't.
+ *
+ * Every caller writes a credential or a per-user pref against the returned user,
+ * so an unlinked identity is refused rather than degraded: on an install that
+ * enforces conversation ownership the CLI never mints a user, and storing a
+ * secret against one nobody can sign in as would be worse than a clear refusal.
+ */
 async function resolveUser(): Promise<{ id: string } | null> {
-  const cliId = resolveCliUserId();
-  if (!cliId) {
-    console.error('Could not determine your CLI identity. Set ARCHON_USER_ID (or $USER).');
-    return null;
-  }
-  try {
-    return await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-  } catch (err) {
-    getLog().error({ err: err as Error }, 'cli.ai_resolve_user_failed');
-    console.error(`✗ Could not resolve your Archon user: ${(err as Error).message}`);
-    return null;
+  const identity = await resolveCliIdentity();
+  switch (identity.kind) {
+    case 'resolved':
+      return { id: identity.userId };
+    case 'unset':
+      console.error('Could not determine your CLI identity. Set ARCHON_USER_ID (or $USER).');
+      return null;
+    case 'unlinked':
+      console.error(unlinkedCliIdentityMessage(identity.cliId));
+      return null;
+    case 'unavailable':
+      getLog().error({ err: identity.error }, 'cli.ai_resolve_user_failed');
+      console.error(`✗ Could not resolve your Archon user: ${identity.error.message}`);
+      return null;
   }
 }
 
@@ -449,11 +458,12 @@ export async function aiTierUnsetCommand(
  * identity resolves or the DB read fails (solo installs just see config).
  */
 async function readUserPrefsBestEffort(): Promise<UserAiPrefs> {
-  const cliId = resolveCliUserId();
-  if (!cliId) return {};
+  // A miss — no identity set, or one no Archon user has claimed — is the same
+  // answer as "no overrides": show the install config.
+  const userId = await resolveCliUserRecordId();
+  if (!userId) return {};
   try {
-    const user = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-    return await getUserAiPrefs(user.id);
+    return await getUserAiPrefs(userId);
   } catch (err) {
     getLog().warn({ err: err as Error }, 'cli.ai_user_prefs_read_failed');
     // Visible notice so the listing isn't mistaken for "you have no overrides".

@@ -20,6 +20,7 @@ mock.module('./connection', () => ({
 
 import {
   findOrCreateUserByPlatformIdentity,
+  findUserByPlatformIdentity,
   getUserById,
   updateUserDisplayName,
   linkGithubIdentity,
@@ -73,6 +74,44 @@ describe('users', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
       const result = await getUserById('user-missing');
       expect(result).toBeNull();
+    });
+  });
+
+  // #3135: the CLI uses this under conversation-ownership enforcement, where
+  // minting a user for an unlinked shell identity would bind ('cli', <name>) to
+  // an account nobody can sign in as and block the console claim forever.
+  describe('findUserByPlatformIdentity', () => {
+    test('returns the user holding the identity', async () => {
+      const u = userRow();
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([identityRow({ platform: 'cli' })]))
+        .mockResolvedValueOnce(createQueryResult([u]));
+
+      expect(await findUserByPlatformIdentity('cli', 'rasmus')).toEqual(u);
+      expect(mockWithTransaction).not.toHaveBeenCalled();
+    });
+
+    test('returns null for an unknown identity, creating nothing', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      expect(await findUserByPlatformIdentity('cli', 'rasmus')).toBeNull();
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledWith(
+        'SELECT * FROM remote_agent_user_identities WHERE platform = $1 AND platform_user_id = $2',
+        ['cli', 'rasmus']
+      );
+      expect(mockWithTransaction).not.toHaveBeenCalled();
+    });
+
+    // Repairing an orphan means creating a user, which is what this promises not
+    // to do — the find-or-create path still repairs it.
+    test('returns null for an orphaned identity rather than repairing it', async () => {
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([identityRow({ platform: 'cli' })]))
+        .mockResolvedValueOnce(createQueryResult([]));
+
+      expect(await findUserByPlatformIdentity('cli', 'rasmus')).toBeNull();
+      expect(mockWithTransaction).not.toHaveBeenCalled();
     });
   });
 
