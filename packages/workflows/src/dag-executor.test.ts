@@ -12,7 +12,7 @@ import {
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
 import { removeTempTree } from '@archon/paths/test-utils';
 import { unlinkSync } from 'fs';
-import { join } from 'path';
+import { join, normalize, sep } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
 import { RATE_LIMIT_MAX_RETRIES } from './executor-shared';
@@ -34,6 +34,12 @@ const mockLogger = {
 const mockCaptureWorkflowCompleted = mock<typeof import('@archon/paths').captureWorkflowCompleted>(
   _props => {}
 );
+/**
+ * The Archon home the artifact-pointer gate (#2453) resolves run artifact roots under.
+ * Mutable so the pointer suite can point it at its own temp tree; every other suite in
+ * this file leaves it on the unreachable default, where no pointer can validate.
+ */
+let mockArtifactHome = '/nonexistent/home';
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getCommandFolderSearchPaths: (folder?: string) => {
@@ -47,6 +53,13 @@ mock.module('@archon/paths', () => ({
   getHomeWorkflowsPath: () => '/nonexistent/home/workflows',
   getLegacyHomeWorkflowsPath: () => '/nonexistent/home/.archon/workflows',
   getArchonHome: () => '/nonexistent/home',
+  // Real semantics, rooted at the mutable fake home above, so the artifact-pointer
+  // containment rules are exercised rather than stubbed away.
+  isInsideArchonHome: (candidate: string): boolean =>
+    normalize(candidate) === normalize(mockArtifactHome) ||
+    normalize(candidate).startsWith(normalize(mockArtifactHome) + sep),
+  getRunArtifactsDirForRoot: (root: string, runId: string): string =>
+    join(root, 'artifacts', 'runs', runId),
   // Telemetry is fire-and-forget; mock as a no-op so terminal sites can call it.
   // Hoisted so tests can assert outcome / exit_reason at each terminal site.
   captureWorkflowCompleted: mockCaptureWorkflowCompleted,
@@ -31455,6 +31468,229 @@ describe('exec result contracts (#2453)', () => {
     expect(completed?.data?.structured_output).toBeUndefined();
     expect(String(completed?.data?.node_output)).toBe('  not json  ');
     expect(prompts).toEqual(['raw=[  not json  ]']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2453 — a result may point at a file instead of carrying it. The engine proves
+// every reserved `archon_artifact` pointer addresses a real regular file inside a
+// run this run may see, before the value is persisted, and keeps the value a run
+// id plus a relative path.
+// ---------------------------------------------------------------------------
+
+describe('artifact pointers (#2453)', () => {
+  let testDir: string;
+  let outputRoot: string;
+  const originalArtifactHome = mockArtifactHome;
+
+  type PersistedEvent = {
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  };
+
+  const POINTER_SCHEMA = {
+    type: 'object',
+    properties: {
+      ready: { type: 'boolean' },
+      plan: {
+        type: 'object',
+        properties: {
+          type: { const: 'archon_artifact' },
+          run_id: { type: 'string' },
+          path: { type: 'string' },
+        },
+        required: ['type', 'run_id', 'path'],
+      },
+    },
+    required: ['ready', 'plan'],
+  };
+
+  const RUN_ID = 'pointer-run';
+  const result = (runId: string, path: string): Record<string, unknown> => ({
+    ready: true,
+    plan: { type: 'archon_artifact', run_id: runId, path },
+  });
+
+  function artifactsDir(runId: string): string {
+    return join(outputRoot, 'artifacts', 'runs', runId);
+  }
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-pointer-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    outputRoot = join(testDir, 'workspaces', '_cwd', 'proj');
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    mockArtifactHome = testDir;
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    mockArtifactHome = originalArtifactHome;
+    await removeTempTree(testDir);
+  });
+
+  async function writeArtifact(runId: string, relPath: string): Promise<void> {
+    await mkdir(artifactsDir(runId), { recursive: true });
+    await writeFile(join(artifactsDir(runId), relPath), '# the full plan');
+  }
+
+  /** A script producer emitting `value`, and a consumer reading the pointer field. */
+  function pointerWorkflow(value: Record<string, unknown>): WorkflowDefinition {
+    return {
+      name: 'pointer-contract',
+      description: 'a result that points at a file instead of carrying it',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'producer',
+          runtime: 'bun',
+          script: `process.stdout.write(${JSON.stringify(JSON.stringify(value))});`,
+          output_format: POINTER_SCHEMA,
+        }),
+        dagNodeSchema.parse({
+          id: 'consumer',
+          prompt: 'plan=[$producer.output.plan]',
+          depends_on: ['producer'],
+        }),
+      ],
+    };
+  }
+
+  async function runPointerDag(
+    workflow: WorkflowDefinition,
+    runId: string,
+    options?: {
+      store?: MockWorkflowStore;
+      priorCompletedNodes?: Map<string, PersistedNodeOutput>;
+    }
+  ): Promise<{ events: PersistedEvent[]; prompts: string[] }> {
+    const prompts: string[] = [];
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      prompts.push(prompt);
+      yield { type: 'assistant', content: 'consumer done' };
+      yield { type: 'result', sessionId: 'sid-cons' };
+    });
+    const store = options?.store ?? createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-2453-pointer',
+      testDir,
+      ready(workflow),
+      makeWorkflowRun(runId, { output_root: outputRoot }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      options?.priorCompletedNodes
+    );
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+    return { events, prompts };
+  }
+
+  const producerCompletion = (events: PersistedEvent[]): PersistedEvent | undefined =>
+    events.find(e => e.event_type === 'node_completed' && e.step_name === 'producer');
+  const producerError = (events: PersistedEvent[]): string =>
+    String(
+      (
+        events.find(e => e.event_type === 'node_failed' && e.step_name === 'producer')?.data as
+          | { error?: string }
+          | undefined
+      )?.error
+    );
+
+  it('a pointer at the producing run survives to the consumer as a run id and relative path', async () => {
+    await writeArtifact(RUN_ID, 'plan.md');
+
+    const { events, prompts } = await runPointerDag(
+      pointerWorkflow(result(RUN_ID, 'plan.md')),
+      RUN_ID
+    );
+
+    expect(producerCompletion(events)?.data?.structured_output).toEqual(result(RUN_ID, 'plan.md'));
+    // Never expanded into an absolute path, and never replaced by the file contents.
+    expect(prompts).toEqual([
+      `plan=[{"type":"archon_artifact","run_id":"${RUN_ID}","path":"plan.md"}]`,
+    ]);
+  });
+
+  it('a pointer whose file does not exist fails the producing node before node_completed', async () => {
+    await mkdir(artifactsDir(RUN_ID), { recursive: true });
+
+    const { events, prompts } = await runPointerDag(
+      pointerWorkflow(result(RUN_ID, 'plan.md')),
+      RUN_ID
+    );
+
+    expect(producerCompletion(events)).toBeUndefined();
+    expect(producerError(events)).toContain('refers to a file that does not exist');
+    expect(prompts).toEqual([]);
+  });
+
+  it('a traversal pointer fails the producing node naming the run, the path, and the rule', async () => {
+    await writeArtifact(RUN_ID, 'plan.md');
+
+    const { events } = await runPointerDag(
+      pointerWorkflow(result(RUN_ID, '../../plan.md')),
+      RUN_ID
+    );
+
+    const error = producerError(events);
+    expect(error).toContain("Script node 'producer'");
+    expect(error).toContain(`run '${RUN_ID}'`);
+    expect(error).toContain("path '../../plan.md'");
+    expect(error).toContain("may not contain '..' path segments");
+  });
+
+  it('a pointer at an unrelated run fails the producing node even when that file exists', async () => {
+    await writeArtifact('some-other-run', 'plan.md');
+    const store = createMockStore();
+    store.getWorkflowRun.mockImplementation(async (id: string) =>
+      id === 'some-other-run'
+        ? makeWorkflowRun('some-other-run', { output_root: outputRoot })
+        : null
+    );
+
+    const { events } = await runPointerDag(
+      pointerWorkflow(result('some-other-run', 'plan.md')),
+      RUN_ID,
+      { store }
+    );
+
+    expect(producerError(events)).toContain("names a run outside this run's tree");
+  });
+
+  it('a validated pointer resolves identically after a cold resume', async () => {
+    await writeArtifact(RUN_ID, 'plan.md');
+    const fresh = await runPointerDag(pointerWorkflow(result(RUN_ID, 'plan.md')), RUN_ID);
+    const completed = producerCompletion(fresh.events);
+
+    const resumed = await runPointerDag(pointerWorkflow(result(RUN_ID, 'plan.md')), RUN_ID, {
+      priorCompletedNodes: new Map<string, PersistedNodeOutput>([
+        [
+          'producer',
+          {
+            output: String(completed?.data?.node_output),
+            structuredOutput: completed?.data?.structured_output,
+          },
+        ],
+      ]),
+    });
+
+    expect(resumed.prompts).toEqual(fresh.prompts);
   });
 });
 

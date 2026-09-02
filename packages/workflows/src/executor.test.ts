@@ -2881,6 +2881,44 @@ describe('executeWorkflow', () => {
       expect(flagWrite).toBeUndefined();
     });
 
+    it('mirrors the persisted output_root onto the in-memory run row', async () => {
+      // #2453 — the artifact-pointer gate resolves a run's artifacts through its
+      // `output_root`, and the very first reader is the run that just recorded its own.
+      // A row left NULL in memory would make a run unable to point at its own artifacts
+      // until a resume reloaded it.
+      const created = makeRun({ id: 'run-mirror', output_root: null });
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        createWorkflowRun: mock(async () => created),
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+      });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const write = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      const patch = (write as unknown as [unknown, { output_root?: string }] | undefined)?.[1];
+      expect(typeof patch?.output_root).toBe('string');
+      expect(created.output_root).toBe(patch?.output_root ?? null);
+    });
+
     // #2304 — the contract is "Cleared by the same persistence block the moment
     // a later resume writes a real root". The faulted arm stamps `true`; the
     // else arm MUST ride the same atomic metadata write with `false` on the

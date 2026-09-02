@@ -205,6 +205,39 @@ run's own `$INPUTS`.
 meaning (values may be any JSON value); on `bash:`, `prompt:`, and loop nodes the field is
 ignored with a load warning — inline bodies already reference `$node.output` directly.
 
+### Artifact pointers in a result
+
+A node output is a value, not a file. When a node produces something large, write it under
+`$ARTIFACTS_DIR` and return a **pointer** to it inside the result:
+
+```json
+{ "type": "archon_artifact", "run_id": "01JD…", "path": "review/report.md" }
+```
+
+`type: "archon_artifact"` is reserved by the engine. Any object carrying it, at any depth in
+a node's logical value, must be a valid pointer: `run_id` and `path` are required non-empty
+strings. `path` is relative to that run's own artifacts directory.
+
+Every pointer is checked **before the value is persisted**, so a bad one fails the node that
+produced it rather than surfacing later as a broken link:
+
+| Rule | Rejected |
+|------|----------|
+| Reachable run | Any run that is not this run, an ancestor, a descendant, or a run adopted with `--adopt`. A sibling fan-out child is *not* reachable. |
+| Addressable run | A run whose output location was never recorded, or one recorded outside the Archon home directory. |
+| Relative path | An absolute path, a `..` segment, or a NUL byte. |
+| Containment | A path — including through a symlink — that resolves outside that run's artifacts directory. |
+| Real file | A missing target, or a directory. |
+
+The value stays a run id plus a relative path in node outputs, events, sub-run results,
+fan-out aggregates, and resumed runs. Archon never rewrites it into an absolute path and
+never loads the file's contents into a prompt. Resolving it is an explicit consumer action:
+`GET /api/artifacts/<run_id>/<path>` serves that file (repeating the same containment checks
+for the untrusted request), and within the producing run the file is at
+`$ARTIFACTS_DIR/<path>`. There is no engine-provided way to turn another run's pointer into a
+local path inside a workflow — `$ARTIFACTS_DIR` addresses the current run and
+`$ADOPTED_RUN_DIR` an explicitly adopted one.
+
 ## Substitution Order
 
 Variables are substituted in a defined order:

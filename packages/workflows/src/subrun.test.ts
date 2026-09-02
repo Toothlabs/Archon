@@ -244,6 +244,11 @@ class InMemoryStore implements IWorkflowStore {
       if (updates.status) r.status = updates.status;
       if (updates.outcome) r.outcome = updates.outcome;
       if (updates.metadata) r.metadata = { ...r.metadata, ...updates.metadata };
+      // Write-once, mirroring the real store's COALESCE (#2200): a row must report the
+      // output location it actually recorded, or a reader that resolves artifacts through
+      // it (the artifact-pointer gate, #2453) sees a run that never had one.
+      if (updates.output_root && !r.output_root) r.output_root = updates.output_root;
+      if (updates.working_path && !r.working_path) r.working_path = updates.working_path;
     }
     return Promise.resolve();
   };
@@ -6626,6 +6631,213 @@ nodes:
         e.step_name === 'read'
     );
     expect(String(read?.data?.node_output)).toBe('green=true');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2453 — a child's small result may point at the large file it wrote. The pointer
+// names the CHILD's run and a path relative to that run's artifacts directory; the
+// parent accepts it because the child is a descendant, and rejects a pointer that
+// does not resolve to a real file there.
+// ---------------------------------------------------------------------------
+
+describe('workflow: artifact pointers across the child boundary (#2453)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  /**
+   * A child that writes a file under its own `$ARTIFACTS_DIR` and returns a pointer to
+   * it. `$WORKFLOW_ID` is engine-substituted into shell bodies, so the script names its
+   * own run without the engine inferring it — the pointer is an ordinary authored value.
+   */
+  async function writePointerChild(pointerPath: string, write = true): Promise<void> {
+    await writeWorkflow(
+      'child-pointer',
+      `
+name: child-pointer
+description: writes a plan file and returns a pointer to it
+mutates_checkout: false
+returns: emit
+nodes:
+  - id: emit
+    bash: |
+      ${write ? 'printf \'# the full plan\' > "$ARTIFACTS_DIR/plan.md"' : 'true'}
+      printf '{"ready":true,"plan":{"type":"archon_artifact","run_id":"%s","path":"${pointerPath}"}}' '$WORKFLOW_ID'
+    output_format:
+      type: object
+      properties:
+        ready: { type: boolean }
+        plan:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [ready, plan]
+`
+    );
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subpointer-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await removeTempTree(cwd);
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  it('a parent accepts a pointer at the child run that produced it', async () => {
+    await writePointerChild('plan.md');
+    await writeWorkflow(
+      'parent-pointer',
+      `
+name: parent-pointer
+description: threads a child result carrying an artifact pointer
+nodes:
+  - id: sub
+    workflow: child-pointer
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-pointer'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-pointer');
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-pointer');
+    const subCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'sub'
+    );
+    // The value crossing the boundary is still a run id plus a relative path — the
+    // engine neither expanded it nor read the file.
+    expect(subCompleted?.data?.structured_output).toEqual({
+      ready: true,
+      plan: { type: 'archon_artifact', run_id: child?.id, path: 'plan.md' },
+    });
+    expect(subCompleted?.data?.declared_fields).toEqual(['ready', 'plan']);
+  });
+
+  it('a pointer at a file the child never wrote fails the parent node', async () => {
+    await writePointerChild('missing.md', false);
+    await writeWorkflow(
+      'parent-pointer-missing',
+      `
+name: parent-pointer-missing
+description: the child names a file it did not write
+nodes:
+  - id: sub
+    workflow: child-pointer
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-pointer-missing'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(false);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-pointer-missing');
+    // The child's own producer already rejects it, before the child can complete —
+    // the earliest boundary the value crosses.
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-pointer');
+    const childFailed = store.events.find(
+      e =>
+        e.workflow_run_id === child?.id && e.event_type === 'node_failed' && e.step_name === 'emit'
+    );
+    expect(String(childFailed?.data?.error)).toContain('refers to a file that does not exist');
+    expect(
+      store.events.find(
+        e =>
+          e.workflow_run_id === parent?.id &&
+          e.event_type === 'node_completed' &&
+          e.step_name === 'sub'
+      )
+    ).toBeUndefined();
+  });
+
+  it('a fan-out aggregate carries one validated pointer per child', async () => {
+    await writePointerChild('plan.md');
+    await writeWorkflow(
+      'parent-pointer-fan',
+      `
+name: parent-pointer-fan
+description: fans out over two items, each child pointing at its own plan file
+nodes:
+  - id: items
+    bash: |
+      printf '%s' '["one","two"]'
+  - id: work
+    workflow: child-pointer
+    depends_on: [items]
+    fan_out:
+      items: "$items.output"
+      max_parallel: 2
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-pointer-fan'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-pointer-fan');
+    const children = [...store.runs.values()].filter(r => r.workflow_name === 'child-pointer');
+    expect(children).toHaveLength(2);
+    const workCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'work'
+    );
+    const aggregate = workCompleted?.data?.structured_output as {
+      plan: { run_id: string; path: string };
+    }[];
+    // Each element points at ITS OWN child run, and every one of those runs is a
+    // descendant of this parent — which is what makes the pointers addressable here.
+    expect(aggregate.map(element => element.plan.path)).toEqual(['plan.md', 'plan.md']);
+    expect(new Set(aggregate.map(element => element.plan.run_id))).toEqual(
+      new Set(children.map(c => c.id))
+    );
   });
 });
 

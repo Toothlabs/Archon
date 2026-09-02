@@ -621,6 +621,36 @@ The node's stdout must parse as **one strict JSON document** and satisfy the sch
 
 This is what makes a script and an agent interchangeable as the producer behind a `returns:` node: the contract belongs to whichever node produces the result, not to its kind. A `bash:`/`script:` node with **no** `output_format` is unchanged — stdout stays raw text.
 
+#### A small result that points at a large file
+
+Most useful workflows produce something too big to be a node output — a plan, a report, a diff. Write it under `$ARTIFACTS_DIR` and return a small result that **points** at it:
+
+```yaml
+nodes:
+  - id: plan
+    command: plan                    # writes $ARTIFACTS_DIR/plan.md
+    output_format:
+      type: object
+      properties:
+        ready: { type: boolean }
+        plan:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [ready, plan]
+```
+
+```json
+{ "ready": true, "plan": { "type": "archon_artifact", "run_id": "$WORKFLOW_ID", "path": "plan.md" } }
+```
+
+`type: "archon_artifact"` is reserved. Before the value is persisted, the engine proves each pointer addresses a real regular file inside the named run's artifacts directory, and that the run is one this run may see: itself, an ancestor, a descendant, or a run it adopted with `--adopt`. An absolute path, a `..` segment, a symlink leading out of the directory, a missing file, or an unrelated run fails the producing node, naming the run, the path, and the rule.
+
+The value stays a run id plus a relative path everywhere — in events, in the API, and after a resume. The engine never expands it into an absolute path and never loads the file. To read it, use the two fields directly: `GET /api/artifacts/<run_id>/<path>` serves exactly that file, and inside the producing run `$ARTIFACTS_DIR/<path>` is the same file on disk. See [Artifact pointers](/reference/variables/#artifact-pointers-in-a-result) for the full rule set.
+
 ### `allowed_tools` and `denied_tools` for Tool Restrictions
 
 Restrict which built-in tools a node can use without relying on prompt instructions. Restrictions are enforced at the Claude SDK level.

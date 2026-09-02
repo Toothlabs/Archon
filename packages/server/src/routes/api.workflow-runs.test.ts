@@ -3519,4 +3519,34 @@ describe('GET /api/artifacts/:runId/* storage-key resolution', () => {
     const body = (await response.json()) as { error: string };
     expect(body.error).toBe('Artifact file not found');
   });
+
+  test('an artifact pointer from a run result addresses this route with no extra machinery', async () => {
+    // #2453 — a workflow result may carry { type, run_id, path }, validated by the
+    // engine (packages/workflows/src/artifact-pointer.ts) against the run tree and the
+    // run's artifacts root. Those two fields ARE this route's parameters: the pointer
+    // needs no resolution surface of its own, and the route repeats the containment
+    // checks server-side for the untrusted request path.
+    const runId = 'run-serve-pointer';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(join(dir, 'review'), { recursive: true });
+    await writeFile(join(dir, 'review', 'report.md'), '# the full report');
+
+    const pointer = { type: 'archon_artifact', run_id: runId, path: 'review/report.md' };
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-local',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${pointer.run_id}/${pointer.path}`);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('# the full report');
+  });
 });

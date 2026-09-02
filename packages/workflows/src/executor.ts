@@ -2466,12 +2466,22 @@ export async function executeWorkflow(
       if (readIdentityUnresolved(workflowRun.metadata) === true) {
         updates.metadata = { [RUN_METADATA_KEYS.identityUnresolved]: false };
       }
-      await deps.store.updateWorkflowRun(workflowRun.id, updates).catch((err: Error) => {
-        getLog().error(
-          { err, workflowRunId: workflowRun.id, outputRoot },
-          'workflow.output_root_persist_failed'
-        );
-      });
+      await deps.store
+        .updateWorkflowRun(workflowRun.id, updates)
+        .then(() => {
+          // Keep the in-memory row in step with the write, exactly as the faulted arm
+          // does for `identity_unresolved`. Every in-run reader of `output_root` — the
+          // artifact-pointer gate (#2453) is the first — would otherwise see NULL on the
+          // very run that just recorded its own location, and only agree with the
+          // database after a resume reloaded the row.
+          workflowRun.output_root = outputRoot;
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, outputRoot },
+            'workflow.output_root_persist_failed'
+          );
+        });
     }
   }
 
