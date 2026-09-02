@@ -9,7 +9,7 @@ Mounted at `/console/*`. Not part of the shipped product. Validates the mental m
 ## Routes
 
 - `/console` → Runs view (scope = `all`)
-- `/console/settings` → Settings (assistant config, system health, GitHub identity) — global
+- `/console/settings` → Settings (assistant config, system health, GitHub identity, CLI identity) — global
 - `/console/builder` → Workflow builder (project picker + open a workflow) — global
 - `/console/builder/:name` → Workflow builder editing `:name` (deep-link with `?project=<id>`)
 - `/console/p/:projectId` → Runs view scoped to a project

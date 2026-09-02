@@ -113,6 +113,25 @@ Only meaningful on **multi-user installs** running GitHub App mode (`GITHUB_APP_
 
 The command prints a `verification_uri` and a one-time `user_code`; visit the URL, enter the code, and authorize. On success the access/refresh tokens are stored encrypted (AES-256-GCM) in Archon's database. Exit code 0 on success; 1 if per-user GitHub is disabled, the identity can't be resolved, the code expires, or authorization is denied.
 
+### `auth whoami`
+
+Print the identity this shell acts as, and the Archon user it resolves to.
+
+```bash
+archon auth whoami
+```
+
+```text
+CLI identity:   rasmus
+Archon user id: 4f1c1f2e-... (a remote_agent_users id)
+```
+
+The **CLI identity** comes from `ARCHON_USER_ID`, else `$USER` / `$USERNAME`. Lead with `ARCHON_USER_ID`: interactive shells set `$USER`, but systemd units and many container images do not, so the same human can end up with two identities or none. Exit code 1 when nothing resolves.
+
+On an install with [web auth](/reference/configuration/#web-ui-login-better-auth-optional), conversations you start from the CLI belong to that `cli` identity, which is a *different* Archon user from your web login. To see them in the console, open **Settings → CLI Identity** and paste the CLI identity this prints. The claim is always made from the authenticated web session, never from the CLI: a CLI-side link would let anyone with shell access attach themselves to a web account and inherit its private conversations, GitHub token, and provider credentials. Claiming an identity another Archon user already holds is refused — that user unlinks it first.
+
+Neither id is a secret. Verification comes from holding the web session.
+
 ### `ai`
 
 Manage **per-user AI-provider credentials** (API keys + subscriptions) and **model-tier config**. CLI identity is resolved from `ARCHON_USER_ID` (explicit override) or `$USER` / `$USERNAME`, mapped to a stable Archon user via the `cli` platform identity — the same as [`auth github`](#auth-github).

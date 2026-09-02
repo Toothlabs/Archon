@@ -125,6 +125,7 @@ export function isConversationOwnershipEnforced(env: NodeJS.ProcessEnv = process
  *   - `/api/auth/github` + sub      (per-user GitHub device flow)
  *   - `/api/auth/providers` + sub   (per-user AI-provider keys; sub = PR-3 OAuth)
  *   - `/api/auth/me/ai-prefs` + sub  (per-user AI prefs: tiers/aliases/default)
+ *   - `/api/auth/me/identities` + sub (per-user platform identity linking)
  *
  * NOTE: only GET/POST go through the catch-all, so PUT/DELETE on these paths are
  * never intercepted regardless — but listing them here keeps the allow-list the
@@ -138,6 +139,8 @@ export function isArchonOwnedAuthPath(path: string): boolean {
     path === '/api/auth/providers' ||
     path.startsWith('/api/auth/providers/') ||
     path === '/api/auth/me/ai-prefs' ||
-    path.startsWith('/api/auth/me/ai-prefs/')
+    path.startsWith('/api/auth/me/ai-prefs/') ||
+    path === '/api/auth/me/identities' ||
+    path.startsWith('/api/auth/me/identities/')
   );
 }

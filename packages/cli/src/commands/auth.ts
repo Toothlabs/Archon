@@ -1,7 +1,12 @@
 /**
- * `archon auth github` — connect the current CLI user's GitHub identity via the
- * device flow. Only meaningful when per-user GitHub is enabled (GitHub App +
+ * `archon auth` — CLI identity commands.
+ *
+ * `github` connects the current CLI user's GitHub identity via the device flow.
+ * Only meaningful when per-user GitHub is enabled (GitHub App +
  * TOKEN_ENCRYPTION_KEY); solo `GITHUB_TOKEN` installs don't need it.
+ *
+ * `whoami` prints the identity this shell acts as, which is what a web user
+ * pastes into the console to claim their CLI conversations.
  *
  * CLI identity: ARCHON_USER_ID (explicit override) else $USER/$USERNAME. We
  * resolve it to a stable Archon user via the 'cli' platform identity so the
@@ -47,6 +52,44 @@ export async function resolveCliUserRecordId(): Promise<string | undefined> {
     getLog().warn({ err: error as Error, cliId }, 'cli.user_identity_resolve_failed');
     return undefined;
   }
+}
+
+/**
+ * `archon auth whoami` — print the identity this shell acts as.
+ *
+ * Two ids, because two surfaces consume them: the CLI identity is what a web
+ * user pastes into the console to claim these conversations as theirs, and the
+ * Archon user id is the durable row both surfaces resolve to. Neither is a
+ * secret — verification for a link comes from holding the web session, not from
+ * knowing the CLI name.
+ */
+export async function authWhoamiCommand(): Promise<number> {
+  const cliId = resolveCliUserId();
+  if (!cliId) {
+    console.error(
+      'No CLI identity is set, so conversations and runs started here are unattributed.\n' +
+        'Set ARCHON_USER_ID to a stable name (recommended — $USER is unset in many\n' +
+        'containers and service managers, and differs between them).'
+    );
+    return 1;
+  }
+
+  let user: { id: string };
+  try {
+    user = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+  } catch (err) {
+    getLog().error({ err: err as Error, cliId }, 'cli.auth_whoami_failed');
+    console.error(`Could not resolve your CLI identity: ${(err as Error).message}`);
+    return 1;
+  }
+
+  console.log(`CLI identity:   ${cliId}`);
+  console.log(`Archon user id: ${user.id}`);
+  console.log(
+    '\nOn an install with web auth, link this CLI identity from the console\n' +
+      '(Settings → CLI Identity) to see conversations started here in your own account.'
+  );
+  return 0;
 }
 
 export async function authGithubCommand(): Promise<number> {

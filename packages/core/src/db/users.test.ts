@@ -23,8 +23,12 @@ import {
   getUserById,
   updateUserDisplayName,
   linkGithubIdentity,
+  linkPlatformIdentity,
+  unlinkPlatformIdentity,
+  listUserIdentities,
   updateUserGithubProfile,
   GithubIdentityConflictError,
+  PlatformIdentityConflictError,
 } from './users';
 import type { User, UserIdentity } from '../types';
 
@@ -298,7 +302,7 @@ describe('users', () => {
 
     test('inserts a new identity row when the login is unseen', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([githubIdentity()]));
       await linkGithubIdentity('user-1', 'alice');
       expect(mockQuery).toHaveBeenNthCalledWith(
         2,
@@ -338,6 +342,90 @@ describe('users', () => {
       mockQuery.mockRejectedValueOnce(new Error('connection reset')); // INSERT
       await expect(linkGithubIdentity('user-1', 'alice')).rejects.toThrow('connection reset');
       expect(mockQuery).toHaveBeenCalledTimes(2); // no third (recovery) query
+    });
+  });
+
+  describe('linkPlatformIdentity', () => {
+    const cliIdentity = (overrides: Partial<UserIdentity> = {}): UserIdentity =>
+      identityRow({ id: 'id-cli', platform: 'cli', platform_user_id: 'rasmus', ...overrides });
+
+    test('inserts and returns the identity row when the CLI name is unseen', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([])); // SELECT
+      mockQuery.mockResolvedValueOnce(createQueryResult([cliIdentity()])); // INSERT ... RETURNING
+      const identity = await linkPlatformIdentity('user-1', 'cli', 'rasmus');
+      expect(identity.platform_user_id).toBe('rasmus');
+      expect(mockQuery).toHaveBeenNthCalledWith(2, expect.stringContaining('RETURNING *'), [
+        'user-1',
+        'cli',
+        'rasmus',
+        null,
+      ]);
+    });
+
+    test('re-linking an identity the same user already holds is a no-op', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([cliIdentity({ user_id: 'user-1' })]));
+      const identity = await linkPlatformIdentity('user-1', 'cli', 'rasmus');
+      expect(identity.id).toBe('id-cli');
+      // Only the SELECT ran — no display name to refresh, so nothing is written.
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('refuses an identity bound to a different user without touching the row', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([cliIdentity({ user_id: 'user-other' })]));
+      await expect(linkPlatformIdentity('user-1', 'cli', 'rasmus')).rejects.toBeInstanceOf(
+        PlatformIdentityConflictError
+      );
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('recovers from a concurrent-insert race when the winner is the same user', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([])); // SELECT: not found yet
+      mockQuery.mockRejectedValueOnce(
+        Object.assign(new Error('UNIQUE constraint failed'), { code: '23505' })
+      );
+      mockQuery.mockResolvedValueOnce(createQueryResult([cliIdentity({ user_id: 'user-1' })]));
+      const identity = await linkPlatformIdentity('user-1', 'cli', 'rasmus');
+      expect(identity.user_id).toBe('user-1');
+      expect(mockQuery).toHaveBeenCalledTimes(3);
+    });
+
+    test('race recovery surfaces a conflict when the winner is a different user', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      mockQuery.mockRejectedValueOnce(
+        Object.assign(new Error('UNIQUE constraint failed'), { code: '23505' })
+      );
+      mockQuery.mockResolvedValueOnce(createQueryResult([cliIdentity({ user_id: 'user-other' })]));
+      await expect(linkPlatformIdentity('user-1', 'cli', 'rasmus')).rejects.toBeInstanceOf(
+        PlatformIdentityConflictError
+      );
+    });
+  });
+
+  describe('unlinkPlatformIdentity', () => {
+    test('scopes the DELETE to the holding user and reports the removal', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      await expect(unlinkPlatformIdentity('user-1', 'cli', 'rasmus')).resolves.toBe(true);
+      expect(mockQuery).toHaveBeenCalledWith(
+        'DELETE FROM remote_agent_user_identities WHERE user_id = $1 AND platform = $2 AND platform_user_id = $3',
+        ['user-1', 'cli', 'rasmus']
+      );
+    });
+
+    test('returns false when the caller does not hold the binding', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+      await expect(unlinkPlatformIdentity('user-1', 'cli', 'someone-else')).resolves.toBe(false);
+    });
+  });
+
+  describe('listUserIdentities', () => {
+    test('selects every identity of one user, oldest first', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([identityRow()]));
+      const identities = await listUserIdentities('user-1');
+      expect(identities).toHaveLength(1);
+      expect(mockQuery).toHaveBeenCalledWith(
+        'SELECT * FROM remote_agent_user_identities WHERE user_id = $1 ORDER BY created_at ASC',
+        ['user-1']
+      );
     });
   });
 

@@ -5,13 +5,14 @@ import { AgentsPanel } from '../components/AgentsPanel';
 import { AssistantConfigPanel } from '../components/AssistantConfigPanel';
 import { SystemPanel } from '../components/SystemPanel';
 import { GithubIdentityPanel } from '../components/GithubIdentityPanel';
+import { CliIdentityPanel } from '../components/CliIdentityPanel';
 
 /**
  * Global (installation-wide) console "AI Settings" — sectioned: Model Tiers (the
  * config tiers editor, ungated) → Agents (per-agent credential cards: keys +
  * subscription login, #1956) → Defaults (default assistant + per-provider
- * model) → System → GitHub. Mounted at `/console/settings`; the config write
- * paths (PATCH /api/config/* → ~/.archon/config.yaml) are install-wide.
+ * model) → System → GitHub → CLI identity. Mounted at `/console/settings`; the
+ * config write paths (PATCH /api/config/* → ~/.archon/config.yaml) are install-wide.
  */
 export function SettingsPage(): ReactElement {
   return (
@@ -27,6 +28,7 @@ export function SettingsPage(): ReactElement {
           <AssistantConfigPanel />
           <SystemPanel />
           <GithubIdentityPanel />
+          <CliIdentityPanel />
         </div>
       </div>
     </div>

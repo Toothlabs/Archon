@@ -53,3 +53,63 @@ export const githubConnectionStatusSchema = z
 export const githubDisconnectResponseSchema = z
   .object({ success: z.boolean() })
   .openapi('GithubDisconnectResponse');
+
+/**
+ * Platforms a web user may claim for themselves from the console.
+ *
+ * Only `cli` today, and the narrowness is the point. Linking a chat or forge
+ * identity needs a verified flow started from that platform's side, and `web`
+ * is the identity that authenticates the caller — letting them unlink it would
+ * strand the account and everything owned by it.
+ */
+export const LINKABLE_IDENTITY_PLATFORMS = ['cli'] as const;
+
+export const linkableIdentityPlatformSchema = z.enum(LINKABLE_IDENTITY_PLATFORMS);
+
+/**
+ * One platform identity bound to the calling user. `linkedAt` is the row's
+ * creation timestamp, passed through the shared Date→ISO transform (SQLite
+ * returns its own string form).
+ */
+export const userIdentitySchema = z
+  .object({
+    platform: z.string(),
+    platformUserId: z.string(),
+    displayName: z.string().nullable(),
+    linkedAt: z.string(),
+  })
+  .openapi('UserIdentity');
+
+/** GET /api/auth/me/identities response — every identity of the calling user. */
+export const userIdentityListResponseSchema = z
+  .object({ identities: z.array(userIdentitySchema) })
+  .openapi('UserIdentityListResponse');
+
+/**
+ * POST /api/auth/me/identities request. The endpoint can only ever bind to the
+ * requesting session's own user, which is what makes holding the web session
+ * the verification step — no pending-token table, TTL, or device flow needed.
+ */
+export const linkIdentityBodySchema = z
+  .object({
+    platform: linkableIdentityPlatformSchema,
+    platformUserId: z.string().min(1).max(255),
+  })
+  .strict()
+  .openapi('LinkIdentityBody');
+
+/** POST /api/auth/me/identities response. */
+export const linkIdentityResponseSchema = z
+  .object({ identity: userIdentitySchema })
+  .openapi('LinkIdentityResponse');
+
+/** DELETE /api/auth/me/identities/:platform/:platformUserId path params. */
+export const identityParamsSchema = z.object({
+  platform: linkableIdentityPlatformSchema,
+  platformUserId: z.string().min(1),
+});
+
+/** DELETE /api/auth/me/identities/:platform/:platformUserId response. */
+export const unlinkIdentityResponseSchema = z
+  .object({ success: z.boolean() })
+  .openapi('UnlinkIdentityResponse');

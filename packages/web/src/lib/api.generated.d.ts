@@ -226,6 +226,150 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/auth/me/identities': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List the platform identities linked to the current web user */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Linked identities */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['UserIdentityListResponse'];
+          };
+        };
+        /** @description Web auth required (X-Archon-User header missing) */
+        401: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    put?: never;
+    /** Claim a CLI identity for the current web user */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['LinkIdentityBody'];
+        };
+      };
+      responses: {
+        /** @description Identity linked (idempotent when the caller already holds it) */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['LinkIdentityResponse'];
+          };
+        };
+        /** @description Unsupported platform, or a blank identity */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Web auth required (X-Archon-User header missing) */
+        401: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Already linked to a different Archon user — unlink it there first */
+        409: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/auth/me/identities/{platform}/{platformUserId}': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post?: never;
+    /** Release a linked identity held by the current web user */
+    delete: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          platform: 'cli';
+          platformUserId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Unlinked (idempotent) */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['UnlinkIdentityResponse'];
+          };
+        };
+        /** @description Web auth required (X-Archon-User header missing) */
+        401: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/auth/providers': {
     parameters: {
       query?: never;
@@ -3320,6 +3464,26 @@ export interface components {
       githubLogin: string | null;
     };
     GithubDisconnectResponse: {
+      success: boolean;
+    };
+    UserIdentityListResponse: {
+      identities: components['schemas']['UserIdentity'][];
+    };
+    UserIdentity: {
+      platform: string;
+      platformUserId: string;
+      displayName: string | null;
+      linkedAt: string;
+    };
+    LinkIdentityResponse: {
+      identity: components['schemas']['UserIdentity'];
+    };
+    LinkIdentityBody: {
+      /** @enum {string} */
+      platform: 'cli';
+      platformUserId: string;
+    };
+    UnlinkIdentityResponse: {
       success: boolean;
     };
     ProviderKeyListResponse: {

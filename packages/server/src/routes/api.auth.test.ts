@@ -53,8 +53,27 @@ const mockFindOrCreateUser = mock(async (_platform: string, platformUserId: stri
   updated_at: new Date(),
 }));
 
+// --- Identity linking (a web user claiming their CLI identity) ---
+const mockListUserIdentities = mock(async (_userId: string) => [] as unknown[]);
+const mockLinkPlatformIdentity = mock(
+  async (userId: string, platform: string, platformUserId: string, displayName?: string) => ({
+    id: 'identity-1',
+    user_id: userId,
+    platform,
+    platform_user_id: platformUserId,
+    platform_display_name: displayName ?? null,
+    created_at: new Date('2026-01-01T00:00:00.000Z'),
+  })
+);
+const mockUnlinkPlatformIdentity = mock(
+  async (_userId: string, _platform: string, _platformUserId: string) => true
+);
+
 mock.module('@archon/core/db/users', () => ({
   findOrCreateUserByPlatformIdentity: mockFindOrCreateUser,
+  listUserIdentities: mockListUserIdentities,
+  linkPlatformIdentity: mockLinkPlatformIdentity,
+  unlinkPlatformIdentity: mockUnlinkPlatformIdentity,
 }));
 
 // --- List endpoints we assert the filter threading on ---
@@ -69,6 +88,13 @@ const mockListConversations = mock(
   ) => [] as unknown[]
 );
 
+/**
+ * The route compares with `err instanceof PlatformIdentityConflictError`, so the
+ * class the mocked store throws and the one the mocked module exports have to be
+ * the same object.
+ */
+class FakePlatformIdentityConflictError extends Error {}
+
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
   getDatabaseType: () => 'postgresql',
@@ -81,6 +107,8 @@ mock.module('@archon/core', () => ({
   isPerUserGitHubEnabled: () => false,
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   createLogger: noopLogger,
+  PlatformIdentityConflictError: FakePlatformIdentityConflictError,
+  GithubIdentityConflictError: class GithubIdentityConflictError extends Error {},
 }));
 
 mock.module('@archon/paths', () => ({
@@ -446,5 +474,143 @@ describe('GET /api/conversations — owner scoping (#3135)', () => {
     const res = await makeApp().request('/api/conversations?mine=true');
     expect(res.status).toBe(200);
     expect(visibilityArg()).toEqual({ kind: 'all' });
+  });
+});
+
+describe('identity linking — /api/auth/me/identities (#3135)', () => {
+  beforeEach(() => {
+    authEnabled = false;
+    signupMode = 'open';
+    apiGateEnabled = false;
+    ownershipEnforced = false;
+    authInstance = null;
+    mockFindOrCreateUser.mockClear();
+    // mockClear, not mockReset: each mock's declared implementation is the
+    // default behavior these tests build on, and mockReset would drop it.
+    mockListUserIdentities.mockClear();
+    mockLinkPlatformIdentity.mockClear();
+    mockUnlinkPlatformIdentity.mockClear();
+  });
+
+  const alice = { 'X-Archon-User': 'alice' };
+
+  test('GET requires a web identity → 401 with nothing read', async () => {
+    const res = await makeApp().request('/api/auth/me/identities');
+    expect(res.status).toBe(401);
+    expect(mockListUserIdentities).not.toHaveBeenCalled();
+  });
+
+  test('GET lists the caller’s own identities in wire shape', async () => {
+    mockListUserIdentities.mockResolvedValueOnce([
+      {
+        id: 'i1',
+        user_id: 'user-from-alice',
+        platform: 'cli',
+        platform_user_id: 'rasmus',
+        platform_display_name: 'rasmus',
+        created_at: new Date('2026-01-01T00:00:00.000Z'),
+      },
+    ]);
+    const res = await makeApp().request('/api/auth/me/identities', { headers: alice });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      identities: [
+        {
+          platform: 'cli',
+          platformUserId: 'rasmus',
+          displayName: 'rasmus',
+          linkedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+    });
+    // The caller's own resolved id — never one supplied by the request.
+    expect(mockListUserIdentities).toHaveBeenCalledWith('user-from-alice');
+  });
+
+  test('POST binds the claimed CLI id to the CALLER’s user, not to any id in the body', async () => {
+    const res = await makeApp().request('/api/auth/me/identities', {
+      method: 'POST',
+      headers: { ...alice, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform: 'cli', platformUserId: 'rasmus' }),
+    });
+    expect(res.status).toBe(200);
+    expect(mockLinkPlatformIdentity).toHaveBeenCalledWith(
+      'user-from-alice',
+      'cli',
+      'rasmus',
+      'rasmus'
+    );
+    expect(await res.json()).toEqual({
+      identity: {
+        platform: 'cli',
+        platformUserId: 'rasmus',
+        displayName: 'rasmus',
+        linkedAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+  });
+
+  test('POST requires a web identity → 401 with nothing written', async () => {
+    const res = await makeApp().request('/api/auth/me/identities', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform: 'cli', platformUserId: 'rasmus' }),
+    });
+    expect(res.status).toBe(401);
+    expect(mockLinkPlatformIdentity).not.toHaveBeenCalled();
+  });
+
+  test('POST 409s when the id is already held by another user — never a silent rebind', async () => {
+    mockLinkPlatformIdentity.mockRejectedValueOnce(
+      new FakePlatformIdentityConflictError(
+        "The cli identity 'rasmus' is already linked to a different Archon user."
+      )
+    );
+    const res = await makeApp().request('/api/auth/me/identities', {
+      method: 'POST',
+      headers: { ...alice, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform: 'cli', platformUserId: 'rasmus' }),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toContain('already linked');
+  });
+
+  // Only 'cli' is claimable: a web identity is what authenticates the caller, and
+  // chat/forge identities need a verified flow from that platform's side.
+  test('POST refuses a platform outside the linkable set', async () => {
+    const res = await makeApp().request('/api/auth/me/identities', {
+      method: 'POST',
+      headers: { ...alice, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform: 'web', platformUserId: 'bob' }),
+    });
+    expect(res.status).toBe(400);
+    expect(mockLinkPlatformIdentity).not.toHaveBeenCalled();
+  });
+
+  test('DELETE releases only a binding the caller holds', async () => {
+    mockUnlinkPlatformIdentity.mockResolvedValueOnce(true);
+    const res = await makeApp().request('/api/auth/me/identities/cli/rasmus', {
+      method: 'DELETE',
+      headers: alice,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: true });
+    expect(mockUnlinkPlatformIdentity).toHaveBeenCalledWith('user-from-alice', 'cli', 'rasmus');
+  });
+
+  test('DELETE requires a web identity → 401 with nothing removed', async () => {
+    const res = await makeApp().request('/api/auth/me/identities/cli/rasmus', { method: 'DELETE' });
+    expect(res.status).toBe(401);
+    expect(mockUnlinkPlatformIdentity).not.toHaveBeenCalled();
+  });
+
+  test('DELETE reports success:false when the caller holds no such binding', async () => {
+    mockUnlinkPlatformIdentity.mockResolvedValueOnce(false);
+    const res = await makeApp().request('/api/auth/me/identities/cli/someone-else', {
+      method: 'DELETE',
+      headers: alice,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: false });
   });
 });

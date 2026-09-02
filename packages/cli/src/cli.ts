@@ -108,7 +108,7 @@ import { skillInstallCommand } from './commands/skill';
 import { validateWorkflowsCommand, validateCommandsCommand } from './commands/validate';
 import { serveCommand } from './commands/serve';
 import { doctorCommand } from './commands/doctor';
-import { authGithubCommand } from './commands/auth';
+import { authGithubCommand, authWhoamiCommand } from './commands/auth';
 import {
   aiKeySetCommand,
   aiListCommand,
@@ -210,6 +210,7 @@ Commands:
   skill install [path]       Install archon-cli into .claude/skills and .agents/skills
   doctor [--full]            Verify your Archon setup (Claude/Codex binaries, gh auth, DB, adapters; --full also probes the OpenCode runtime SDK)
   auth github                Connect your GitHub identity via device flow (multi-user installs)
+  auth whoami                Print your CLI identity + Archon user id (paste into the console to link)
   ai key set <provider>      Connect an AI provider API key (multi-user installs; key read from prompt/stdin)
   ai login <provider>        Connect a Claude, ChatGPT/Codex, or Copilot subscription
   ai list                    List your connected AI provider keys
@@ -1124,12 +1125,14 @@ async function main(): Promise<number> {
         switch (subcommand) {
           case 'github':
             return await authGithubCommand();
+          case 'whoami':
+            return await authWhoamiCommand();
           default: {
             const problem =
               subcommand === undefined
                 ? 'Missing auth subcommand'
                 : `Unknown auth subcommand: ${subcommand}`;
-            return await fail(jsonFlag, `${problem}\nAvailable: github`);
+            return await fail(jsonFlag, `${problem}\nAvailable: github, whoami`);
           }
         }
       }

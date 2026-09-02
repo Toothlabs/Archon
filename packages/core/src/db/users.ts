@@ -214,12 +214,36 @@ export async function updateUserDisplayName(userId: string, displayName: string)
 }
 
 /**
+ * Raised when a platform identity is already bound to a different Archon user.
+ * Linking must never silently reassign an identity between users: a silent
+ * rebind is identity theft by re-link, since the new holder inherits the old
+ * one's conversations, tokens, and credentials. The operator unlinks first.
+ */
+export class PlatformIdentityConflictError extends Error {
+  constructor(
+    public readonly platform: IdentityPlatform,
+    public readonly platformUserId: string,
+    message?: string
+  ) {
+    super(
+      message ??
+        `The ${platform} identity '${platformUserId}' is already linked to a different Archon user.`
+    );
+    this.name = 'PlatformIdentityConflictError';
+  }
+}
+
+/**
  * Raised when a GitHub account is already linked to a different Archon user.
  * Connecting must never silently reassign an identity from one user to another.
  */
-export class GithubIdentityConflictError extends Error {
+export class GithubIdentityConflictError extends PlatformIdentityConflictError {
   constructor(public readonly login: string) {
-    super(`GitHub account @${login} is already linked to a different Archon user.`);
+    super(
+      'github',
+      login,
+      `GitHub account @${login} is already linked to a different Archon user.`
+    );
     this.name = 'GithubIdentityConflictError';
   }
 }
@@ -245,44 +269,105 @@ export async function updateUserGithubProfile(
   );
 }
 
+/** Every platform identity currently bound to one Archon user, oldest first. */
+export async function listUserIdentities(userId: string): Promise<readonly UserIdentity[]> {
+  const result = await pool.query<UserIdentity>(
+    'SELECT * FROM remote_agent_user_identities WHERE user_id = $1 ORDER BY created_at ASC',
+    [userId]
+  );
+  return result.rows;
+}
+
 /**
- * Attach a GitHub identity to an EXISTING Archon user (the connecting actor).
- * Unlike findOrCreateUserByPlatformIdentity, this never mints a new user — the
- * device-flow connect surfaces already have the actor's user_id and only need
- * to bind their GitHub login to it. Throws GithubIdentityConflictError if the
- * login already maps to a different user.
+ * Attach a platform identity to an EXISTING Archon user. Unlike
+ * findOrCreateUserByPlatformIdentity, this never mints a new user — the caller
+ * already holds the actor's user_id and only needs to bind a second identity to
+ * it, which is how a web user claims their CLI name or their GitHub login.
+ *
+ * Re-linking an identity the same user already holds is a no-op apart from an
+ * opportunistic display-name refresh. Binding one held by somebody else throws
+ * PlatformIdentityConflictError — never a silent reassignment.
  */
-export async function linkGithubIdentity(userId: string, login: string): Promise<void> {
-  const platform: IdentityPlatform = 'github';
-  const existing = await selectIdentity(platform, login);
+export async function linkPlatformIdentity(
+  userId: string,
+  platform: IdentityPlatform,
+  platformUserId: string,
+  displayName?: string
+): Promise<UserIdentity> {
+  const existing = await selectIdentity(platform, platformUserId);
   if (existing) {
     if (existing.user_id !== userId) {
-      throw new GithubIdentityConflictError(login);
+      throw new PlatformIdentityConflictError(platform, platformUserId);
     }
-    await pool.query(
-      'UPDATE remote_agent_user_identities SET platform_display_name = $1 WHERE id = $2',
-      [login, existing.id]
-    );
-    getLog().info({ userId, login }, 'user.github_identity_relinked');
-    return;
+    const staleDisplayName =
+      displayName !== undefined && existing.platform_display_name !== displayName;
+    if (staleDisplayName) {
+      await pool.query(
+        'UPDATE remote_agent_user_identities SET platform_display_name = $1 WHERE id = $2',
+        [displayName, existing.id]
+      );
+    }
+    getLog().info({ userId, platform, platformUserId }, 'user.identity_relinked');
+    return staleDisplayName ? { ...existing, platform_display_name: displayName } : existing;
   }
   try {
-    await pool.query(
+    const inserted = await pool.query<UserIdentity>(
       `INSERT INTO remote_agent_user_identities (user_id, platform, platform_user_id, platform_display_name)
-       VALUES ($1, $2, $3, $4)`,
-      [userId, platform, login, login]
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [userId, platform, platformUserId, displayName ?? null]
     );
-    getLog().info({ userId, login }, 'user.github_identity_linked');
+    const row = inserted.rows[0];
+    if (!row) throw new Error('users.identity_link_returned_no_row');
+    getLog().info({ userId, platform, platformUserId }, 'user.identity_linked');
+    return row;
   } catch (err) {
-    // Concurrent connect of the same ('github', login) raced us past the SELECT
-    // and inserted first. UNIQUE(platform, platform_user_id) rejects the loser —
-    // re-read and honor the winner: conflict if it's a different user, otherwise
-    // a no-op (e.g. a double-clicked "Connect GitHub").
+    // A concurrent link of the same (platform, platform_user_id) raced us past
+    // the SELECT and inserted first. UNIQUE(platform, platform_user_id) rejects
+    // the loser — re-read and honor the winner: conflict when it is a different
+    // user, otherwise a no-op (e.g. a double-clicked "Link").
     if (!isUniqueViolation(err)) throw err;
-    const winner = await selectIdentity(platform, login);
-    if (winner && winner.user_id !== userId) {
-      throw new GithubIdentityConflictError(login);
+    const winner = await selectIdentity(platform, platformUserId);
+    if (!winner) throw err;
+    if (winner.user_id !== userId) {
+      throw new PlatformIdentityConflictError(platform, platformUserId);
     }
-    getLog().info({ userId, login }, 'user.github_identity_link_race_recovered');
+    getLog().info({ userId, platform, platformUserId }, 'user.identity_link_race_recovered');
+    return winner;
+  }
+}
+
+/**
+ * Detach a platform identity from the user who holds it. Returns false when the
+ * binding does not exist (idempotent).
+ *
+ * `user_id` in the WHERE clause is the authorization: a caller can only ever
+ * remove a binding their own user already holds, so this cannot be used to strip
+ * someone else's identity.
+ */
+export async function unlinkPlatformIdentity(
+  userId: string,
+  platform: IdentityPlatform,
+  platformUserId: string
+): Promise<boolean> {
+  const result = await pool.query(
+    'DELETE FROM remote_agent_user_identities WHERE user_id = $1 AND platform = $2 AND platform_user_id = $3',
+    [userId, platform, platformUserId]
+  );
+  const removed = (result.rowCount ?? 0) > 0;
+  if (removed) getLog().info({ userId, platform, platformUserId }, 'user.identity_unlinked');
+  return removed;
+}
+
+/**
+ * Attach a GitHub identity to an EXISTING Archon user (the connecting actor).
+ * Thin wrapper over linkPlatformIdentity that keeps the GitHub-specific conflict
+ * error the device-flow surfaces already show to the operator.
+ */
+export async function linkGithubIdentity(userId: string, login: string): Promise<void> {
+  try {
+    await linkPlatformIdentity(userId, 'github', login, login);
+  } catch (err) {
+    if (err instanceof PlatformIdentityConflictError) throw new GithubIdentityConflictError(login);
+    throw err;
   }
 }

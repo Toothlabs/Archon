@@ -42,6 +42,7 @@ import {
   persistGithubConnection,
   DeviceFlowError,
   GithubIdentityConflictError,
+  PlatformIdentityConflictError,
   getUserGithubTokenRecord,
   deleteUserGithubToken,
   isPerUserProviderKeysEnabled,
@@ -358,6 +359,11 @@ import {
   devicePollResponseSchema,
   githubConnectionStatusSchema,
   githubDisconnectResponseSchema,
+  userIdentityListResponseSchema,
+  linkIdentityBodySchema,
+  linkIdentityResponseSchema,
+  identityParamsSchema,
+  unlinkIdentityResponseSchema,
 } from './schemas/auth.schemas';
 import {
   providerKeyListResponseSchema,
@@ -1380,6 +1386,61 @@ const githubDisconnectRoute = createRoute({
   },
 });
 
+// ---- Identity linking: a web user claims their own CLI identity ----
+// The direction of trust is the whole design. The link is asserted by the
+// authenticated web user ("this CLI name is me"), never by the CLI ("I am this
+// web user") — a CLI-side write would let anyone with shell attach themselves to
+// any web user and inherit that user's private conversations, GitHub token, and
+// provider credentials. Every route below targets the requesting session's own
+// user and cannot name another.
+const identityListRoute = createRoute({
+  method: 'get',
+  path: '/api/auth/me/identities',
+  tags: ['Auth'],
+  summary: 'List the platform identities linked to the current web user',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: userIdentityListResponseSchema } },
+      description: 'Linked identities',
+    },
+    401: jsonError('Web auth required (X-Archon-User header missing)'),
+  },
+});
+
+const identityLinkRoute = createRoute({
+  method: 'post',
+  path: '/api/auth/me/identities',
+  tags: ['Auth'],
+  summary: 'Claim a CLI identity for the current web user',
+  request: {
+    body: { content: { 'application/json': { schema: linkIdentityBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: linkIdentityResponseSchema } },
+      description: 'Identity linked (idempotent when the caller already holds it)',
+    },
+    400: jsonError('Unsupported platform, or a blank identity'),
+    401: jsonError('Web auth required (X-Archon-User header missing)'),
+    409: jsonError('Already linked to a different Archon user — unlink it there first'),
+  },
+});
+
+const identityUnlinkRoute = createRoute({
+  method: 'delete',
+  path: '/api/auth/me/identities/{platform}/{platformUserId}',
+  tags: ['Auth'],
+  summary: 'Release a linked identity held by the current web user',
+  request: { params: identityParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: unlinkIdentityResponseSchema } },
+      description: 'Unlinked (idempotent)',
+    },
+    401: jsonError('Web auth required (X-Archon-User header missing)'),
+  },
+});
+
 // ---- Per-user AI-provider credential (API-key) connect endpoints ----
 const providerKeyListRoute = createRoute({
   method: 'get',
@@ -1633,7 +1694,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 401 | 403 | 404 | 422 | 500 | 503,
+    status: 400 | 401 | 403 | 404 | 409 | 422 | 500 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -2120,6 +2181,75 @@ export function registerApiRoutes(
     } catch (err) {
       getLog().error({ err: err as Error, userId: web.userId }, 'auth.github_disconnect_failed');
       return apiError(c, 500, 'Failed to disconnect GitHub');
+    }
+  });
+
+  // ---- Identity linking ----
+  // requireWebUser resolves the acting user and every call below passes that id
+  // and nothing from the request, so a caller can only ever read or change their
+  // own bindings.
+  function toApiIdentity(row: import('@archon/core').UserIdentity): {
+    platform: string;
+    platformUserId: string;
+    displayName: string | null;
+    linkedAt: string;
+  } {
+    return {
+      platform: row.platform,
+      platformUserId: row.platform_user_id,
+      displayName: row.platform_display_name,
+      linkedAt: toISOString(row.created_at),
+    };
+  }
+
+  registerOpenApiRoute(identityListRoute, async c => {
+    const web = await requireWebUser(c, 'Web authentication required to manage linked identities');
+    if ('error' in web) return web.error;
+    try {
+      const identities = await userDb.listUserIdentities(web.userId);
+      return c.json({ identities: identities.map(toApiIdentity) });
+    } catch (err) {
+      getLog().error({ err: err as Error, userId: web.userId }, 'auth.identity_list_failed');
+      return apiError(c, 500, 'Failed to read linked identities');
+    }
+  });
+
+  registerOpenApiRoute(identityLinkRoute, async c => {
+    const web = await requireWebUser(c, 'Web authentication required to link an identity');
+    if ('error' in web) return web.error;
+    const { platform, platformUserId } = getValidatedBody(c, linkIdentityBodySchema);
+    const claimed = platformUserId.trim();
+    if (!claimed) return apiError(c, 400, 'platformUserId must not be blank');
+    try {
+      const identity = await userDb.linkPlatformIdentity(web.userId, platform, claimed, claimed);
+      return c.json({ identity: toApiIdentity(identity) });
+    } catch (err) {
+      // A conflict is a refusal, not a failure: rebinding silently would hand
+      // the claimant everything the current holder owns.
+      if (err instanceof PlatformIdentityConflictError) {
+        return apiError(c, 409, err.message);
+      }
+      getLog().error(
+        { err: err as Error, userId: web.userId, platform },
+        'auth.identity_link_failed'
+      );
+      return apiError(c, 500, 'Failed to link identity');
+    }
+  });
+
+  registerOpenApiRoute(identityUnlinkRoute, async c => {
+    const web = await requireWebUser(c, 'Web authentication required to unlink an identity');
+    if ('error' in web) return web.error;
+    const { platform, platformUserId } = getValidatedParams(c, identityParamsSchema);
+    try {
+      const removed = await userDb.unlinkPlatformIdentity(web.userId, platform, platformUserId);
+      return c.json({ success: removed });
+    } catch (err) {
+      getLog().error(
+        { err: err as Error, userId: web.userId, platform },
+        'auth.identity_unlink_failed'
+      );
+      return apiError(c, 500, 'Failed to unlink identity');
     }
   });
 
@@ -3471,6 +3601,11 @@ export function registerApiRoutes(
   /** Access Zod-validated body from a handler registered via registerOpenApiRoute. */
   function getValidatedBody<T>(c: Context, _schema: z.ZodType<T>): T {
     return (c.req as unknown as { valid(k: 'json'): T }).valid('json');
+  }
+
+  /** Access Zod-validated path params from a handler registered via registerOpenApiRoute. */
+  function getValidatedParams<T>(c: Context, _schema: z.ZodType<T>): T {
+    return (c.req as unknown as { valid(k: 'param'): T }).valid('param');
   }
 
   // Serve OpenAPI spec

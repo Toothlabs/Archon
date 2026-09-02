@@ -212,7 +212,11 @@ export {
 export {
   updateUserGithubProfile,
   linkGithubIdentity,
+  linkPlatformIdentity,
+  unlinkPlatformIdentity,
+  listUserIdentities,
   GithubIdentityConflictError,
+  PlatformIdentityConflictError,
 } from './db/users';
 
 // Per-user AI-provider credentials (Phase 2, #1891 PR-1)
