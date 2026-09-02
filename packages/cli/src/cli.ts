@@ -109,6 +109,7 @@ import { validateWorkflowsCommand, validateCommandsCommand } from './commands/va
 import { serveCommand } from './commands/serve';
 import { doctorCommand } from './commands/doctor';
 import { authGithubCommand, authWhoamiCommand } from './commands/auth';
+import { conversationsClaimCommand, conversationsListCommand } from './commands/conversations';
 import {
   aiKeySetCommand,
   aiListCommand,
@@ -211,6 +212,12 @@ Commands:
   doctor [--full]            Verify your Archon setup (Claude/Codex binaries, gh auth, DB, adapters; --full also probes the OpenCode runtime SDK)
   auth github                Connect your GitHub identity via device flow (multi-user installs)
   auth whoami                Print your CLI identity + Archon user id (paste into the console to link)
+  conversations list --unowned
+                             List conversations no Archon user owns (what a claim would take)
+  conversations claim --user <archon-user-id>
+                             Attach unowned conversations + runs to one user, after
+                             turning web auth on ([--platform web|cli] [--before <iso>]
+                             [--dry-run] [--yes])
   ai key set <provider>      Connect an AI provider API key (multi-user installs; key read from prompt/stdin)
   ai login <provider>        Connect a Claude, ChatGPT/Codex, or Copilot subscription
   ai list                    List your connected AI provider keys
@@ -263,6 +270,11 @@ Options:
   --timeout <seconds>        For 'workflow wait': give up after N seconds (default: wait indefinitely)
   --conversation-id <id>     Reuse a stable conversation scope across runs (enables
                              persist_session resume between separate CLI invocations)
+  --unowned                  For 'conversations list': the rows no Archon user owns
+  --platform <web|cli>       For 'conversations': narrow to one operator surface
+  --user <archon-user-id>    For 'conversations claim': the user rows are claimed for
+  --before <iso>             For 'conversations claim': only rows older than this date
+  --yes                      Confirm a destructive/ownership-changing command
   --port <port>              Override server port for 'serve' (default: 3090)
   --download-only            Download web UI without starting the server
   --force                    Overwrite existing file (for workflow install)
@@ -449,6 +461,7 @@ async function main(): Promise<number> {
     'telemetry',
     'auth',
     'ai',
+    'conversations',
   ];
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
 
@@ -1133,6 +1146,35 @@ async function main(): Promise<number> {
                 ? 'Missing auth subcommand'
                 : `Unknown auth subcommand: ${subcommand}`;
             return await fail(jsonFlag, `${problem}\nAvailable: github, whoami`);
+          }
+        }
+      }
+
+      case 'conversations': {
+        switch (subcommand) {
+          case 'list':
+            return await conversationsListCommand({
+              unowned: values.unowned as boolean | undefined,
+              platform: values.platform as string | undefined,
+              limit: values.limit as string | undefined,
+            });
+          case 'claim':
+            return await conversationsClaimCommand({
+              user: values.user as string | undefined,
+              platform: values.platform as string | undefined,
+              before: values.before as string | undefined,
+              dryRun: dryRunFlag,
+              yes: values.yes as boolean | undefined,
+            });
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing conversations subcommand'
+                : `Unknown conversations subcommand: ${subcommand}`;
+            return await fail(
+              jsonFlag,
+              `${problem}\nAvailable: list --unowned, claim --user <archon-user-id>`
+            );
           }
         }
       }
