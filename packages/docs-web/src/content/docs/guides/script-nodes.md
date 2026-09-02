@@ -252,7 +252,10 @@ With a schema declared, the node:
   of silently resolving to `''`.
 
 That is the same contract an AI node's `output_format` carries, so a script and
-an agent are interchangeable as the producer behind a `returns:` node.
+an agent are interchangeable as the producer behind a `returns:` node. What that
+buys a caller — through an `include:` alias, a `workflow:` sub-run, a fan-out, or
+an artifact pointer — is described once in
+[Authoring workflows → Result contracts](/guides/authoring-workflows/#result-contracts).
 
 A schemaless script is unchanged: stdout stays raw text, byte for byte.
 

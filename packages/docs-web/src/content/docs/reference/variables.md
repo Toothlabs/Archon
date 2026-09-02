@@ -216,7 +216,9 @@ A node output is a value, not a file. When a node produces something large, writ
 
 `type: "archon_artifact"` is reserved by the engine. Any object carrying it, at any depth in
 a node's logical value, must be a valid pointer: `run_id` and `path` are required non-empty
-strings. `path` is relative to that run's own artifacts directory.
+strings. `path` is relative to that run's own artifacts directory. For how a pointer fits
+into a workflow's declared result, see
+[Authoring workflows → Result contracts](/guides/authoring-workflows/#result-contracts).
 
 Every pointer is checked **before the value is persisted**, so a bad one fails the node that
 produced it rather than surfacing later as a broken link:

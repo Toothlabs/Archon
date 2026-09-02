@@ -1,0 +1,37 @@
+name: e2e-contract-unit
+description: |
+  ENGINE-PRIMITIVE TEST — the per-unit body of `e2e-contract-fanout`, and the second
+  half of its point: a fan-out instance owns its own result contract exactly like any
+  other workflow. Its `returns:` node is a script that certifies `{id, ok}`, so the
+  parent's aggregate is an array of validated objects rather than an array of prose.
+
+  Reads the item through `$INPUTS.unit` (the name the caller's `fan_out.as` binds) as
+  the `INPUTS_UNIT` environment variable — an object item arrives as its canonical
+  JSON text, which is why the script parses it.
+
+  Zero AI nodes. Usage: not run directly; `e2e-contract-fanout` includes it.
+mutates_checkout: false
+
+inputs:
+  unit:
+    required: true
+    description: one element of the caller's units array, as canonical JSON text
+
+returns: check
+
+nodes:
+  - id: check
+    runtime: bun
+    script: |
+      const unit = JSON.parse(process.env.INPUTS_UNIT ?? 'null');
+      if (unit === null || typeof unit !== 'object') {
+        throw new Error(`expected an object unit, received: ${process.env.INPUTS_UNIT}`);
+      }
+      // stdout is the contract, so nothing else may be printed on it.
+      console.log(JSON.stringify({ id: unit.id, ok: typeof unit.title === 'string' }));
+    output_format:
+      type: object
+      properties:
+        id: { type: string }
+        ok: { type: boolean }
+      required: [id, ok]

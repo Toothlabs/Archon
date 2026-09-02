@@ -6841,6 +6841,265 @@ nodes:
   });
 });
 
+// ---------------------------------------------------------------------------
+// #2453 — the composed proof across a governed run boundary. The same contract the
+// in-run composed test drives (a certified script result carrying a unit list and an
+// artifact pointer) is produced by a CHILD run instead of an included block, and the
+// parent declares no `output_format` of its own anywhere. What it reads — a declared
+// field, a fan-out over that field, and an un-rewritten pointer — comes entirely from
+// the child's contract.
+// ---------------------------------------------------------------------------
+
+describe('workflow: a child contract drives the parent composed path (#2453)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  const UNITS = [
+    { id: 'unit-a', title: 'first unit of work' },
+    { id: 'unit-b', title: 'second unit of work' },
+  ];
+  const AGGREGATE = [
+    { id: 'unit-a', ok: true },
+    { id: 'unit-b', ok: true },
+  ];
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subcomposed-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+
+    // The governed child: a deterministic producer that certifies its own result,
+    // writes the large artifact, and points at it.
+    await writeWorkflow(
+      'child-plan',
+      `
+name: child-plan
+description: certifies a unit list plus a pointer at the plan it wrote
+mutates_checkout: false
+returns: build
+nodes:
+  - id: build
+    runtime: bun
+    script: |
+      import { writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      writeFileSync(join(process.env.ARTIFACTS_DIR, 'plan.md'), '# the full plan');
+      console.log(
+        JSON.stringify({
+          units: ${JSON.stringify(UNITS)},
+          plan: { type: 'archon_artifact', run_id: process.env.WORKFLOW_ID, path: 'plan.md' },
+        })
+      );
+    output_format:
+      type: object
+      properties:
+        units:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              title: { type: string }
+            required: [id, title]
+        plan:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [units, plan]
+`
+    );
+
+    // The per-item body the parent fans out inside its own run. It owns its own
+    // per-item contract, exactly as it would with any other producer upstream.
+    await writeWorkflow(
+      'unit-block',
+      `
+name: unit-block
+description: one instance per unit, certifying its own per-item result
+mutates_checkout: false
+inputs:
+  unit:
+    required: true
+returns: check
+nodes:
+  - id: check
+    runtime: bun
+    script: |
+      const unit = JSON.parse(process.env.INPUTS_UNIT);
+      console.log(JSON.stringify({ id: unit.id, ok: typeof unit.title === 'string' }));
+    output_format:
+      type: object
+      properties:
+        id: { type: string }
+        ok: { type: boolean }
+      required: [id, ok]
+`
+    );
+  });
+
+  afterEach(async () => {
+    await removeTempTree(cwd);
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  it('fans out over a child-declared field and threads the pointer, with no caller schema anywhere', async () => {
+    await writeWorkflow(
+      'composed-parent',
+      `
+name: composed-parent
+description: declares no output_format of its own and reads the child's contract
+mutates_checkout: false
+nodes:
+  - id: sub
+    workflow: child-plan
+  - id: work
+    include: unit-block
+    depends_on: [sub]
+    fan_out:
+      items: "$sub.output.units"
+      as: unit
+      max_parallel: 2
+      join: all_success
+  - id: verify
+    depends_on: [work]
+    bash: |
+      printf 'aggregate=%s pointer=%s' $work.output $sub.output.plan
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('composed-parent'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'composed-parent');
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-plan');
+    const parentEvent = (type: string, step: string) =>
+      store.events.find(
+        e => e.workflow_run_id === parent?.id && e.event_type === type && e.step_name === step
+      );
+
+    // The child stamped its own projection; the parent node completed under it without
+    // repeating a single line of the child's schema.
+    expect(child?.metadata?.summary_declared_fields).toEqual(['units', 'plan']);
+    expect(parentEvent('node_completed', 'sub')?.data?.declared_fields).toEqual(['units', 'plan']);
+
+    // `fan_out.items` read the child-declared `units` field as a real array.
+    expect(parentEvent('node_completed', 'work')?.data?.structured_output).toEqual(AGGREGATE);
+
+    // The pointer names the CHILD's run and stayed a run id plus a relative path.
+    expect(String(parentEvent('node_completed', 'verify')?.data?.node_output)).toBe(
+      `aggregate=${JSON.stringify(AGGREGATE)} pointer=${JSON.stringify({
+        type: 'archon_artifact',
+        run_id: child?.id,
+        path: 'plan.md',
+      })}`
+    );
+  });
+
+  it('re-resolves the child-declared field for a fan-out that first runs after a cold resume', async () => {
+    await writeWorkflow(
+      'composed-parent-resume',
+      `
+name: composed-parent-resume
+description: fails BEFORE the fan-out, so the resumed run re-resolves the child's field
+mutates_checkout: false
+nodes:
+  - id: sub
+    workflow: child-plan
+  - id: gate
+    depends_on: [sub]
+    bash: |
+      if [ -f "$STATE_DIR/gate-marker" ]; then echo open; else touch "$STATE_DIR/gate-marker"; exit 1; fi
+  - id: work
+    include: unit-block
+    depends_on: [gate]
+    fan_out:
+      items: "$sub.output.units"
+      as: unit
+      max_parallel: 2
+      join: all_success
+  - id: verify
+    depends_on: [work]
+    bash: |
+      printf 'aggregate=%s' $work.output
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const first = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('composed-parent-resume'),
+      'goal',
+      'conv-db'
+    );
+    expect(first.success).toBe(false);
+
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'composed-parent-resume');
+    expect(
+      store.events.some(
+        e =>
+          e.workflow_run_id === parent?.id &&
+          e.event_type === 'node_completed' &&
+          e.step_name === 'work'
+      )
+    ).toBe(false);
+    const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(parent!.id))!);
+    // The parent's own definition never carried the contract; the snapshot does.
+    expect(hydrated?.priorCompletedNodes.get('sub')?.declaredFields).toEqual(['units', 'plan']);
+
+    const second = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('composed-parent-resume'),
+      'goal',
+      'conv-db',
+      { ...hydrated! }
+    );
+
+    expect(second.success).toBe(true);
+    const verify = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'verify'
+    );
+    // The fan-out ran for the FIRST time on the resumed run, so its item list came
+    // from the rehydrated child contract rather than from a live child return.
+    expect(String(verify?.data?.node_output)).toBe(`aggregate=${JSON.stringify(AGGREGATE)}`);
+    // The child ran once: the resumed parent reused its persisted result and contract.
+    expect([...store.runs.values()].filter(r => r.workflow_name === 'child-plan')).toHaveLength(1);
+  });
+});
+
 /**
  * Regression for the recursive `workflow:` sub-run path inside runChildWorkflow
  * (review R1). The wrap the new `capturedSourceOwner` field introduced in
