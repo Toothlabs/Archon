@@ -53,6 +53,38 @@ class MigrationHistoryResponse(BaseModel):
     current_version: str
 
 
+class ApplyMigrationRequest(BaseModel):
+    """Request to apply a specific migration."""
+
+    version: str
+    name: str
+
+
+class ApplyMigrationResult(BaseModel):
+    """Result of applying a single migration."""
+
+    version: str
+    name: str
+    error: str | None = None
+
+
+class ApplyMigrationsResponse(BaseModel):
+    """Response from applying migrations."""
+
+    success: bool
+    message: str
+    applied: list[ApplyMigrationResult]
+    failed: list[ApplyMigrationResult]
+    remaining: int | None = None
+
+
+class ExecutionCapabilityResponse(BaseModel):
+    """Response indicating if direct SQL execution is available."""
+
+    can_execute: bool
+    message: str
+
+
 # Create router
 router = APIRouter(prefix="/api/migrations", tags=["migrations"])
 
@@ -168,3 +200,100 @@ async def get_pending_migrations():
     except Exception as e:
         logfire.error(f"Error getting pending migrations: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get pending migrations: {str(e)}") from e
+
+
+@router.get("/can-execute", response_model=ExecutionCapabilityResponse)
+async def check_execution_capability():
+    """
+    Check if direct SQL execution is available.
+
+    Returns whether DATABASE_URL is configured and migrations can be applied remotely.
+    """
+    can_execute = migration_service.is_direct_execution_available()
+
+    if can_execute:
+        return ExecutionCapabilityResponse(
+            can_execute=True,
+            message="Direct SQL execution is available. Migrations can be applied remotely.",
+        )
+    else:
+        return ExecutionCapabilityResponse(
+            can_execute=False,
+            message="DATABASE_URL is not configured. Migrations must be applied manually via Supabase SQL Editor.",
+        )
+
+
+@router.post("/apply", response_model=ApplyMigrationsResponse)
+async def apply_all_migrations():
+    """
+    Apply all pending migrations in order.
+
+    Executes migrations sequentially, stopping on first failure to maintain integrity.
+    Requires DATABASE_URL to be configured for direct PostgreSQL access.
+    """
+    try:
+        # Check if direct execution is available
+        if not migration_service.is_direct_execution_available():
+            raise HTTPException(
+                status_code=400,
+                detail="DATABASE_URL is not configured. Cannot apply migrations remotely. "
+                       "Please set DATABASE_URL or apply migrations manually via Supabase SQL Editor.",
+            )
+
+        result = await migration_service.apply_all_pending()
+
+        return ApplyMigrationsResponse(
+            success=result["success"],
+            message=result["message"],
+            applied=[ApplyMigrationResult(**m) for m in result["applied"]],
+            failed=[ApplyMigrationResult(**m) for m in result["failed"]],
+            remaining=result.get("remaining"),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Error applying migrations: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to apply migrations: {str(e)}") from e
+
+
+@router.post("/apply/single", response_model=ApplyMigrationsResponse)
+async def apply_single_migration(request: ApplyMigrationRequest):
+    """
+    Apply a specific migration by version and name.
+
+    Args:
+        request: Migration version and name to apply
+
+    Requires DATABASE_URL to be configured for direct PostgreSQL access.
+    """
+    try:
+        # Check if direct execution is available
+        if not migration_service.is_direct_execution_available():
+            raise HTTPException(
+                status_code=400,
+                detail="DATABASE_URL is not configured. Cannot apply migrations remotely.",
+            )
+
+        result = await migration_service.apply_single_migration(request.version, request.name)
+
+        if result["success"]:
+            return ApplyMigrationsResponse(
+                success=True,
+                message=result["message"],
+                applied=[ApplyMigrationResult(version=request.version, name=request.name)],
+                failed=[],
+            )
+        else:
+            return ApplyMigrationsResponse(
+                success=False,
+                message=result.get("error", "Migration failed"),
+                applied=[],
+                failed=[ApplyMigrationResult(version=request.version, name=request.name, error=result.get("error"))],
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Error applying migration {request.version}/{request.name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to apply migration: {str(e)}") from e

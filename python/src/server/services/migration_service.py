@@ -3,14 +3,15 @@ Database migration tracking and management service.
 """
 
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import logfire
 from supabase import Client
 
-from .client_manager import get_supabase_client
 from ..config.version import ARCHON_VERSION
+from .client_manager import get_postgres_connection, get_supabase_client, is_direct_sql_enabled
 
 
 class MigrationRecord:
@@ -44,11 +45,16 @@ class MigrationService:
 
     def __init__(self):
         self._supabase: Client | None = None
-        # Handle both Docker (/app/migration) and local (./migration) environments
-        if Path("/app/migration").exists():
-            self._migrations_dir = Path("/app/migration")
-        else:
-            self._migrations_dir = Path("migration")
+        # Handle Docker, local from project root, and local from python/ subdirectory
+        possible_paths = [
+            Path("/app/migration"),  # Docker environment
+            Path("migration"),  # Running from project root
+            Path(__file__).parent.parent.parent.parent.parent / "migration",  # From python/src/server/services/
+        ]
+        self._migrations_dir = next(
+            (p for p in possible_paths if p.exists() and p.is_dir()),
+            Path("migration"),  # Fallback
+        )
 
     def _get_supabase_client(self) -> Client:
         """Get or create Supabase client."""
@@ -149,11 +155,18 @@ class MigrationService:
                     migration_name = sql_file.stem
 
                     # Create pending migration object
+                    # Use path relative to project root (migrations dir parent) for portability
+                    try:
+                        relative_path = sql_file.relative_to(self._migrations_dir.parent)
+                    except ValueError:
+                        # Fallback to absolute path if relative fails
+                        relative_path = sql_file
+
                     migration = PendingMigration(
                         version=version,
                         name=migration_name,
                         sql_content=sql_content,
-                        file_path=str(sql_file.relative_to(Path.cwd())),
+                        file_path=str(relative_path),
                     )
                     migrations.append(migration)
                 except Exception as e:
@@ -227,6 +240,174 @@ class MigrationService:
             "pending_count": len(pending),
             "applied_count": len(applied),
         }
+
+    def is_direct_execution_available(self) -> bool:
+        """
+        Check if direct SQL execution is available.
+
+        Returns:
+            True if DATABASE_URL is configured and direct execution is possible
+        """
+        return is_direct_sql_enabled()
+
+    async def apply_migration(self, migration: PendingMigration) -> dict[str, Any]:
+        """
+        Apply a single migration to the database.
+
+        Args:
+            migration: The PendingMigration to apply
+
+        Returns:
+            Dict with success status and details
+
+        Raises:
+            ValueError: If direct SQL execution is not available
+            Exception: If migration execution fails
+        """
+        if not self.is_direct_execution_available():
+            raise ValueError(
+                "Direct SQL execution is not available. "
+                "Set DATABASE_URL in your environment to enable remote migrations."
+            )
+
+        try:
+            async with get_postgres_connection() as conn:
+                logfire.info(f"Applying migration: {migration.version}/{migration.name}")
+
+                # Execute the migration SQL within a transaction
+                async with conn.transaction():
+                    await conn.execute(migration.sql_content)
+
+                    # Check if archon_migrations table exists before recording
+                    # Bootstrap case: migrations 001-007 run before 008 creates the table
+                    # Migration 008 retroactively records all prior migrations
+                    table_exists = await conn.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM information_schema.tables
+                            WHERE table_schema = 'public'
+                            AND table_name = 'archon_migrations'
+                        )
+                        """
+                    )
+
+                    if table_exists:
+                        # Record the migration in archon_migrations table
+                        await conn.execute(
+                            """
+                            INSERT INTO archon_migrations (version, migration_name, checksum, applied_at)
+                            VALUES ($1, $2, $3, $4)
+                            ON CONFLICT (version, migration_name) DO NOTHING
+                            """,
+                            migration.version,
+                            migration.name,
+                            migration.checksum,
+                            datetime.now(UTC),
+                        )
+                    else:
+                        logfire.info(
+                            f"Skipping migration tracking for {migration.version}/{migration.name} "
+                            "(archon_migrations table not yet created)"
+                        )
+
+                logfire.info(f"Successfully applied migration: {migration.version}/{migration.name}")
+
+                return {
+                    "success": True,
+                    "version": migration.version,
+                    "name": migration.name,
+                    "message": f"Migration {migration.version}/{migration.name} applied successfully",
+                }
+
+        except Exception as e:
+            logfire.error(f"Failed to apply migration {migration.version}/{migration.name}: {e}")
+            return {
+                "success": False,
+                "version": migration.version,
+                "name": migration.name,
+                "error": str(e),
+            }
+
+    async def apply_all_pending(self) -> dict[str, Any]:
+        """
+        Apply all pending migrations in order.
+
+        Returns:
+            Dict with overall status and individual migration results
+        """
+        if not self.is_direct_execution_available():
+            return {
+                "success": False,
+                "error": "Direct SQL execution is not available. Set DATABASE_URL in your environment.",
+                "applied": [],
+                "failed": [],
+            }
+
+        pending = await self.get_pending_migrations()
+
+        if not pending:
+            return {
+                "success": True,
+                "message": "No pending migrations to apply",
+                "applied": [],
+                "failed": [],
+            }
+
+        applied = []
+        failed = []
+
+        for migration in pending:
+            result = await self.apply_migration(migration)
+            if result["success"]:
+                applied.append({
+                    "version": migration.version,
+                    "name": migration.name,
+                })
+            else:
+                failed.append({
+                    "version": migration.version,
+                    "name": migration.name,
+                    "error": result.get("error", "Unknown error"),
+                })
+                # Stop on first failure to maintain migration order integrity
+                break
+
+        return {
+            "success": len(failed) == 0,
+            "message": f"Applied {len(applied)} migrations" + (f", {len(failed)} failed" if failed else ""),
+            "applied": applied,
+            "failed": failed,
+            "remaining": len(pending) - len(applied) - len(failed),
+        }
+
+    async def apply_single_migration(self, version: str, name: str) -> dict[str, Any]:
+        """
+        Apply a specific migration by version and name.
+
+        Args:
+            version: Migration version directory name
+            name: Migration file name (without .sql extension)
+
+        Returns:
+            Dict with success status and details
+        """
+        pending = await self.get_pending_migrations()
+
+        # Find the specific migration
+        migration = None
+        for m in pending:
+            if m.version == version and m.name == name:
+                migration = m
+                break
+
+        if not migration:
+            return {
+                "success": False,
+                "error": f"Migration {version}/{name} not found in pending migrations. "
+                         "It may have already been applied or does not exist.",
+            }
+
+        return await self.apply_migration(migration)
 
 
 # Export singleton instance

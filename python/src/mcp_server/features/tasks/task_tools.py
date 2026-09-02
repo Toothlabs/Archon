@@ -207,6 +207,7 @@ def register_task_tools(mcp: FastMCP):
         status: str | None = None,
         assignee: str | None = None,
         task_order: int | None = None,
+        priority: str | None = None,
         feature: str | None = None
     ) -> str:
         """
@@ -230,7 +231,8 @@ def register_task_tools(mcp: FastMCP):
                      created by your system (e.g., "ResearchAgent-1", "CodeReviewer").
                      Common values: "User", "Archon", "Coding Agent"
                      Default: "User"
-            task_order: Priority 0-100 (higher = more priority)
+            task_order: Sort order 0-100 (higher = more priority in lists)
+            priority: "low" | "medium" | "high" | "critical" (default: "medium")
             feature: Feature label for grouping
 
         Examples:
@@ -262,6 +264,7 @@ def register_task_tools(mcp: FastMCP):
                             "description": description or "",
                             "assignee": assignee or "User",
                             "task_order": task_order or 0,
+                            "priority": priority or "medium",
                             "feature": feature,
                             "sources": [],
                             "code_examples": [],
@@ -305,6 +308,8 @@ def register_task_tools(mcp: FastMCP):
                         update_fields["assignee"] = assignee
                     if task_order is not None:
                         update_fields["task_order"] = task_order
+                    if priority is not None:
+                        update_fields["priority"] = priority
                     if feature is not None:
                         update_fields["feature"] = feature
 
