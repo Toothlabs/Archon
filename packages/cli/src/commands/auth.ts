@@ -29,6 +29,26 @@ export function resolveCliUserId(env: NodeJS.ProcessEnv = process.env): string |
   return sys || null;
 }
 
+/**
+ * The acting CLI user's Archon id, or undefined when `ARCHON_USER_ID`/`$USER` is unset
+ * or the identity cannot be resolved. Attribution is best-effort by design — a chat turn
+ * or a workflow run must not fail because the user table could not be reached.
+ *
+ * Shared by every CLI surface that stamps a row with the local operator: the chat and
+ * workflow conversation rows, the workflow run row, and the persisted user message.
+ */
+export async function resolveCliUserRecordId(): Promise<string | undefined> {
+  const cliId = resolveCliUserId();
+  if (!cliId) return undefined;
+  try {
+    const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+    return cliUser.id;
+  } catch (error) {
+    getLog().warn({ err: error as Error, cliId }, 'cli.user_identity_resolve_failed');
+    return undefined;
+  }
+}
+
 export async function authGithubCommand(): Promise<number> {
   if (!isPerUserGitHubEnabled()) {
     console.error(

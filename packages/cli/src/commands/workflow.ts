@@ -150,7 +150,7 @@ import {
   requestDetachedRunStop,
   startDetachedRunControlServer,
 } from '../utils/detached-run-control';
-import { resolveCliUserId } from './auth';
+import { resolveCliUserId, resolveCliUserRecordId } from './auth';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -808,23 +808,6 @@ async function resolveSupersededRun(runId: string): Promise<WorkflowRun> {
     throw new Error(`Cannot supersede run '${superseded.id}': it is still ${superseded.status}.`);
   }
   return superseded;
-}
-
-/**
- * The acting CLI user's Archon id, or undefined when `ARCHON_USER_ID`/`$USER` is unset
- * or the identity cannot be resolved. Attribution is best-effort by design — a run must
- * not fail because the user table could not be reached.
- */
-async function resolveCliUserRecordId(): Promise<string | undefined> {
-  const cliId = resolveCliUserId();
-  if (!cliId) return undefined;
-  try {
-    const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-    return cliUser.id;
-  } catch (error) {
-    getLog().warn({ err: error as Error, cliId }, 'cli.user_identity_resolve_failed');
-    return undefined;
-  }
 }
 
 /**
@@ -2142,11 +2125,19 @@ async function runWorkflowWithOwnedSource(
       // the stamps the executor only writes when IT creates the row. `working_path` is
       // the one field this process cannot know — the child cuts the worktree — so it
       // stays null until the child fills it in (write-once in the store).
+
+      // Resolved BEFORE the conversation row so the row carries the operator too, not
+      // just the run: an ownerless `cli` conversation is unreachable on an install that
+      // enforces conversation ownership (#3135).
+      const detachedUserId = await resolveCliUserRecordId();
       let detachedConversation;
       try {
         detachedConversation = await conversationDb.getOrCreateConversation(
           'cli',
-          childConversationId
+          childConversationId,
+          undefined,
+          undefined,
+          detachedUserId
         );
       } catch (error) {
         const err = error as Error;
@@ -2154,7 +2145,6 @@ async function runWorkflowWithOwnedSource(
           `Failed to access database: ${err.message}\nHint: Check that DATABASE_URL is set and the database is running.`
         );
       }
-      const detachedUserId = await resolveCliUserRecordId();
       const continuationDeclaration =
         adoptedRunId !== undefined
           ? { mode: 'adopt' as const, runId: adoptedRunId }
@@ -2296,10 +2286,25 @@ async function runWorkflowWithOwnedSource(
   // Generate conversation ID
   const conversationId = options.conversationId ?? generateConversationId();
 
+  // Resolve the CLI user once (ARCHON_USER_ID, else $USER/$USERNAME). When set,
+  // upsert via the `cli` platform identity so the same Archon user is reused
+  // across invocations — this is what attributes the conversation row, the workflow
+  // run, and the persisted user message to the human running the command, and what
+  // `getUserProviderEnv` keys on for per-user AI-provider credentials (#1891 Phase 2).
+  // The conversation row needs it first: an ownerless `cli` conversation is
+  // unreachable on an install that enforces conversation ownership (#3135).
+  const cliUserId = await resolveCliUserRecordId();
+
   // Get or create conversation in database
   let conversation;
   try {
-    conversation = await conversationDb.getOrCreateConversation('cli', conversationId);
+    conversation = await conversationDb.getOrCreateConversation(
+      'cli',
+      conversationId,
+      undefined,
+      undefined,
+      cliUserId
+    );
   } catch (error) {
     const err = error as Error;
     throw new Error(
@@ -2795,13 +2800,6 @@ async function runWorkflowWithOwnedSource(
 
   // Wire adapter for assistant message persistence
   adapter.setConversationDbId(conversationId, conversation.id);
-
-  // Resolve the CLI user once (ARCHON_USER_ID, else $USER/$USERNAME). When set,
-  // upsert via the `cli` platform identity so the same Archon user is reused
-  // across invocations — this is what attributes the workflow run to the human
-  // running the command and what `getUserProviderEnv` keys on for per-user
-  // AI-provider credentials (#1891 Phase 2).
-  const cliUserId = await resolveCliUserRecordId();
 
   // Persist user message for Web UI history.
   try {

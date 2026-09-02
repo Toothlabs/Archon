@@ -528,6 +528,25 @@ function createDetachedChildFixture(pid: number | null = 12345): {
  * the fake timer hangs — and one that never awaits the command silently skips the
  * window altogether. Both suites go through here so neither can pass by accident.
  */
+/**
+ * Every CLI identity source `resolveCliUserId` reads, in one place so a test can pin
+ * the acting operator (or clear it entirely) without depending on the shell that runs
+ * the suite.
+ */
+const CLI_IDENTITY_ENV_KEYS = ['ARCHON_USER_ID', 'USER', 'USERNAME'] as const;
+
+function snapshotCliIdentityEnv(): Record<string, string | undefined> {
+  return Object.fromEntries(CLI_IDENTITY_ENV_KEYS.map(key => [key, process.env[key]]));
+}
+
+function restoreCliIdentityEnv(saved: Record<string, string | undefined>): void {
+  for (const key of CLI_IDENTITY_ENV_KEYS) {
+    const value = saved[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
 async function finishStartupWindow(
   commandPromise: Promise<void>,
   spawnSpy: ReturnType<typeof spyOn>,
@@ -1304,6 +1323,69 @@ describe('workflowRunCommand — requires: [github] gate', () => {
     ).rejects.toThrow(/connected github identity/i);
 
     expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+// #3135: a `cli` conversation with no user_id is reachable by nobody on an install
+// that enforces conversation ownership, so the run's conversation row must carry the
+// operator the run itself is already attributed to.
+describe('workflowRunCommand — CLI operator attribution (#3135)', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+  let savedIdentityEnv: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    savedIdentityEnv = snapshotCliIdentityEnv();
+    const conversationsDb = await import('@archon/core/db/conversations');
+    const usersDb = await import('@archon/core/db/users');
+    (conversationsDb.getOrCreateConversation as ReturnType<typeof mock>).mockClear();
+    (usersDb.findOrCreateUserByPlatformIdentity as ReturnType<typeof mock>).mockClear();
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+    restoreCliIdentityEnv(savedIdentityEnv);
+  });
+
+  it('stamps the resolved operator on the conversation row', async () => {
+    process.env.ARCHON_USER_ID = 'rasmus';
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist' }, 'project')],
+      errors: [],
+    });
+
+    await workflowRunCommand('/repo/root', 'assist', 'hello', { noWorktree: true });
+
+    const usersDb = await import('@archon/core/db/users');
+    expect(usersDb.findOrCreateUserByPlatformIdentity).toHaveBeenCalledWith(
+      'cli',
+      'rasmus',
+      'rasmus'
+    );
+    const conversationsDb = await import('@archon/core/db/conversations');
+    const call = (conversationsDb.getOrCreateConversation as ReturnType<typeof mock>).mock
+      .calls[0] as [string, string, undefined, undefined, string | undefined];
+    expect(call[0]).toBe('cli');
+    expect(call[4]).toBe('user-cli-1');
+  });
+
+  it('leaves the row unattributed when no CLI identity resolves', async () => {
+    for (const key of CLI_IDENTITY_ENV_KEYS) delete process.env[key];
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist' }, 'project')],
+      errors: [],
+    });
+
+    await workflowRunCommand('/repo/root', 'assist', 'hello', { noWorktree: true });
+
+    const usersDb = await import('@archon/core/db/users');
+    expect(usersDb.findOrCreateUserByPlatformIdentity).not.toHaveBeenCalled();
+    const conversationsDb = await import('@archon/core/db/conversations');
+    const call = (conversationsDb.getOrCreateConversation as ReturnType<typeof mock>).mock
+      .calls[0] as [string, string, undefined, undefined, string | undefined];
+    expect(call[4]).toBeUndefined();
   });
 });
 
@@ -5493,6 +5575,42 @@ describe('workflowRunCommand — detach', () => {
     expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
   });
 
+  // #3135: the parent writes the child's conversation row before forking, so that row
+  // — not just the run row — has to carry the operator.
+  it('stamps the resolved operator on the pre-created conversation row', async () => {
+    const savedIdentityEnv = snapshotCliIdentityEnv();
+    process.env.ARCHON_USER_ID = 'rasmus';
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const conversationsDb = await import('@archon/core/db/conversations');
+    const workflowDb = await import('@archon/core/db/workflows');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+      errors: [],
+    });
+    (conversationsDb.getOrCreateConversation as ReturnType<typeof mock>).mockClear();
+    (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    try {
+      const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', { detach: true });
+      await finishStartupWindow(commandPromise, spawnSpy);
+    } finally {
+      spawnSpy.mockRestore();
+      restoreCliIdentityEnv(savedIdentityEnv);
+    }
+
+    const call = (conversationsDb.getOrCreateConversation as ReturnType<typeof mock>).mock
+      .calls[0] as [string, string, undefined, undefined, string | undefined];
+    expect(call[0]).toBe('cli');
+    expect(call[4]).toBe('user-cli-1');
+    // The run row and the conversation row must agree on who started the work.
+    const runRow = (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      user_id?: string;
+    };
+    expect(runRow?.user_id).toBe('user-cli-1');
+  });
+
   it('resolves an adopted run prefix before passing it to the detached child', async () => {
     const adoptedRunId = '0b1ee8da-1111-2222-3333-444455556666';
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
@@ -7644,7 +7762,12 @@ describe('workflowApproveCommand', () => {
 
     // Verify the original platform conversation ID was passed through
     expect(conversationsDb.getConversationById).toHaveBeenCalledWith('db-uuid-original');
-    expect(conversationsDb.getOrCreateConversation).toHaveBeenCalledWith('cli', 'cli-original-123');
+    // Only the platform/id pair is this test's subject; the trailing attribution
+    // args depend on the ambient CLI identity and are covered separately.
+    const [platformType, platformId] = (
+      conversationsDb.getOrCreateConversation as ReturnType<typeof mock>
+    ).mock.calls[0] as [string, string];
+    expect([platformType, platformId]).toEqual(['cli', 'cli-original-123']);
   });
 
   it('should discover workflows from codebase.default_cwd, not working_path', async () => {
@@ -8344,7 +8467,12 @@ describe('workflowRejectCommand', () => {
 
     // Verify the original platform conversation ID was passed through
     expect(conversationsDb.getConversationById).toHaveBeenCalledWith('db-uuid-reject');
-    expect(conversationsDb.getOrCreateConversation).toHaveBeenCalledWith('cli', 'cli-reject-456');
+    // Only the platform/id pair is this test's subject; the trailing attribution
+    // args depend on the ambient CLI identity and are covered separately.
+    const [platformType, platformId] = (
+      conversationsDb.getOrCreateConversation as ReturnType<typeof mock>
+    ).mock.calls[0] as [string, string];
+    expect([platformType, platformId]).toEqual(['cli', 'cli-reject-456']);
   });
 
   it('cancels when max attempts reached', async () => {

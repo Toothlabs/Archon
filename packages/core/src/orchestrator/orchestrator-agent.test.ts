@@ -4980,6 +4980,87 @@ describe('resolveUserProviderEnvForChat — chat env injection', () => {
   });
 });
 
+// ─── handleMessage — attributed CLI chat turn (#3135) ─────────────────────────
+
+describe('handleMessage — attributed CLI chat turn', () => {
+  // The CLI never threaded a user id until #3135, so `executionUserId` was always
+  // undefined on a CLI turn and every one of them short-circuited to install-level
+  // config. Now that `archon chat` resolves the local operator, a CLI turn takes the
+  // same per-user path as every other surface — that is the consequence of attributing
+  // the conversation row, and it is asserted here rather than assumed.
+  function makeCliPlatform(): IPlatformAdapter {
+    return { ...makePlatform(), getPlatformType: mock(() => 'cli') };
+  }
+
+  beforeEach(() => {
+    mockSendQuery.mockReset();
+    mockSendQuery.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'ok' };
+      yield { type: 'result', sessionId: 'session-1' };
+    });
+    mockParseCommand.mockReturnValue(null);
+    mockGetOrCreateConversation.mockReset();
+    mockGetRecentWorkflowResultMessages.mockReset();
+    mockGetRecentWorkflowResultMessages.mockImplementation(() => Promise.resolve([]));
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+    mockListCodebases.mockReset();
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockGetUserAiPrefsDb.mockReset();
+    mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
+    mockListDecryptedUserProviderCredentials.mockReset();
+    mockListDecryptedUserProviderCredentials.mockImplementation(async () => []);
+    mockIsPerUserProviderKeysEnabled.mockReset();
+    mockIsPerUserProviderKeysEnabled.mockImplementation(() => true);
+    mockGenerateAndSetTitle.mockReset();
+    mockGenerateAndSetTitle.mockImplementation(() => Promise.resolve());
+  });
+
+  test("an attributed CLI turn resolves the operator's prefs and credentials", async () => {
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(
+        makeConversation({
+          platform_type: 'cli',
+          platform_conversation_id: 'cli-chat-1',
+          user_id: 'user-cli-1',
+        })
+      )
+    );
+
+    await handleMessage(makeCliPlatform(), 'cli-chat-1', 'hello', { userId: 'user-cli-1' });
+
+    // The row itself is stamped with the operator — an ownerless `cli` row is
+    // unreachable on an install that enforces conversation ownership.
+    expect(mockGetOrCreateConversation).toHaveBeenCalledWith(
+      'cli',
+      'cli-chat-1',
+      undefined,
+      undefined,
+      'user-cli-1'
+    );
+    expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('user-cli-1');
+    expect(mockListDecryptedUserProviderCredentials).toHaveBeenCalledWith('user-cli-1');
+  });
+
+  test('an unattributed CLI turn still short-circuits to install config', async () => {
+    // No ARCHON_USER_ID / $USER on the box: the operator is unresolvable, the row stays
+    // ownerless, and the turn runs exactly as it did before this phase.
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(
+        makeConversation({ platform_type: 'cli', platform_conversation_id: 'cli-chat-1' })
+      )
+    );
+
+    await handleMessage(makeCliPlatform(), 'cli-chat-1', 'hello', { userId: undefined });
+
+    expect(mockGetUserAiPrefsDb).not.toHaveBeenCalled();
+    expect(mockListDecryptedUserProviderCredentials).not.toHaveBeenCalled();
+    expect(mockSendQuery).toHaveBeenCalled();
+  });
+});
+
 // ─── handleMessage — /setproject dispatch ─────────────────────────────────────
 
 describe('handleMessage — /setproject dispatch', () => {

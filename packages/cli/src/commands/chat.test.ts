@@ -1,7 +1,7 @@
 /**
  * Tests for the CLI chat command
  */
-import { describe, test, expect, mock, beforeEach, spyOn } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 
 // Mock logger before any imports
 const mockLogger = {
@@ -33,12 +33,46 @@ mock.module('@archon/core', () => ({
   handleMessage: mockHandleMessage,
 }));
 
+// The `cli` platform identity upsert behind resolveCliUserRecordId().
+const mockFindOrCreateUser = mock(async (_platform: string, _platformUserId: string) => ({
+  id: 'user-cli-1',
+}));
+mock.module('@archon/core/db/users', () => ({
+  findOrCreateUserByPlatformIdentity: mockFindOrCreateUser,
+}));
+
 import { chatCommand } from './chat';
 import { CLIAdapter } from '../adapters/cli-adapter';
 
+/** Every CLI identity source, saved so a test can clear them and put them back. */
+const IDENTITY_ENV_KEYS = ['ARCHON_USER_ID', 'USER', 'USERNAME'] as const;
+
+function snapshotIdentityEnv(): Record<string, string | undefined> {
+  return Object.fromEntries(IDENTITY_ENV_KEYS.map(key => [key, process.env[key]]));
+}
+
+function restoreIdentityEnv(saved: Record<string, string | undefined>): void {
+  for (const key of IDENTITY_ENV_KEYS) {
+    const value = saved[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
 describe('chatCommand', () => {
+  let savedIdentityEnv: Record<string, string | undefined>;
+
   beforeEach(() => {
     mockHandleMessage.mockClear();
+    mockFindOrCreateUser.mockClear();
+    savedIdentityEnv = snapshotIdentityEnv();
+    // Deterministic operator for the default case; the attribution tests below
+    // override it. Without this, the result depends on the shell running tests.
+    process.env.ARCHON_USER_ID = 'cli-tester';
+  });
+
+  afterEach(() => {
+    restoreIdentityEnv(savedIdentityEnv);
   });
 
   test('should call handleMessage with a CLIAdapter, unique conversationId, and the message', async () => {
@@ -110,5 +144,53 @@ describe('chatCommand', () => {
     } finally {
       consoleSpy.mockRestore();
     }
+  });
+
+  // #3135: a `cli` conversation row with no user_id is reachable by nobody on an
+  // install that enforces conversation ownership, so the operator has to ride along.
+  describe('operator attribution', () => {
+    test('attributes the conversation to the resolved CLI operator', async () => {
+      process.env.ARCHON_USER_ID = 'rasmus';
+
+      await chatCommand('hello');
+
+      expect(mockFindOrCreateUser).toHaveBeenCalledWith('cli', 'rasmus', 'rasmus');
+      const [, , , context] = mockHandleMessage.mock.calls[0] as [
+        unknown,
+        string,
+        string,
+        { userId?: string },
+      ];
+      expect(context).toEqual({ userId: 'user-cli-1' });
+    });
+
+    test('leaves the conversation unattributed when no CLI identity resolves', async () => {
+      for (const key of IDENTITY_ENV_KEYS) delete process.env[key];
+
+      await chatCommand('hello');
+
+      expect(mockFindOrCreateUser).not.toHaveBeenCalled();
+      const [, , , context] = mockHandleMessage.mock.calls[0] as [
+        unknown,
+        string,
+        string,
+        { userId?: string },
+      ];
+      expect(context).toEqual({ userId: undefined });
+    });
+
+    test('a user-table failure still sends the turn, unattributed', async () => {
+      mockFindOrCreateUser.mockRejectedValueOnce(new Error('db gone'));
+
+      await chatCommand('hello');
+
+      const [, , , context] = mockHandleMessage.mock.calls[0] as [
+        unknown,
+        string,
+        string,
+        { userId?: string },
+      ];
+      expect(context).toEqual({ userId: undefined });
+    });
   });
 });
