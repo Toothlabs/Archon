@@ -2391,6 +2391,42 @@ nodes:
     expect(parent?.status).toBe('failed');
   });
 
+  it('refuses to load a fan-out node whose output_format cannot be compiled (#2453)', async () => {
+    // The uncompilable-schema gate inside the fan-out join is a backstop; an
+    // authored file never reaches it, because the load rejects the workflow
+    // before a single child run is created.
+    await writeWorkflow(
+      'fan-parent-broken-schema',
+      `
+name: fan-parent-broken-schema
+description: fan-out declaring a contract ajv cannot compile
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["a","b"]'
+  - id: work
+    workflow: fan-child-ok
+    depends_on: [plan]
+    mutates_checkout: false
+    output_format:
+      type: object
+      properties:
+        verdict:
+          $ref: "#/$defs/missing"
+    fan_out:
+      items: "$plan.output"
+      join: all_success
+`
+    );
+
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    expect(result.workflows.some(w => w.workflow.name === 'fan-parent-broken-schema')).toBe(false);
+    const loadError = result.errors.find(e => e.filename.includes('fan-parent-broken-schema'));
+    expect(loadError?.error).toContain(
+      "Node 'work' declares an output_format that cannot be compiled"
+    );
+  });
+
   it('completes the fan-out when every child matches the declared output_format (#2774)', async () => {
     await writeWorkflow(
       'fan-child-ok',

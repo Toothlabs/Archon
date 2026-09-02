@@ -3000,7 +3000,10 @@ async function executeNodeInternal(
       if (structuredOutput !== undefined) {
         // Validate against the declared schema for EVERY provider — SDK-enforced
         // ones still bypass grammar-constrained decoding on a refusal / max_tokens
-        // truncation. Fail-SAFE on an uncompilable schema, but surface it.
+        // truncation. An uncompilable schema FAILS the node (#2453): the loader
+        // compiles every declared `output_format`, so reaching this branch means a
+        // definition bypassed the loader — continuing would let a declared contract
+        // cross the boundary unenforced, after the turn was already paid for.
         let schemaCompileError: string | undefined;
         const validation = validateStructuredOutput(
           structuredOutput,
@@ -3014,11 +3017,8 @@ async function executeNodeInternal(
             { nodeId: node.id, workflowRunId: workflowRun.id, compileMsg: schemaCompileError },
             'dag.structured_output_schema_uncompilable'
           );
-          await safeSendMessage(
-            platform,
-            conversationId,
-            `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so the structured output was NOT validated against it. Fix the schema to enforce it.`,
-            nodeContext
+          throw new Error(
+            `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), so its declared contract cannot be enforced. Fix the schema.`
           );
         }
         if (validation.valid) {
@@ -6689,7 +6689,9 @@ async function executeLoopNode(
         if (attemptStructured !== undefined) {
           // Validate against the declared schema for EVERY provider — an SDK-enforced
           // one still bypasses grammar-constrained decoding on a refusal or a
-          // max_tokens truncation. Fail-SAFE on an uncompilable schema, but say so.
+          // max_tokens truncation. An uncompilable schema FAILS the node (#2453),
+          // same contract as the ordinary AI gate: the loader already rejects one,
+          // so continuing here would enforce nothing after paying for the iteration.
           let schemaCompileError: string | undefined;
           const validation = validateStructuredOutput(
             attemptStructured,
@@ -6708,11 +6710,15 @@ async function executeLoopNode(
               },
               'loop_node.structured_output_schema_uncompilable'
             );
-            await safeSendMessage(
-              platform,
-              conversationId,
-              `⚠️ Loop \`${node.id}\`: its \`output_format\` schema could not be compiled (${schemaCompileError}), so the iteration output was NOT validated against it. Fix the schema to enforce it.`,
-              msgContext
+            return await failLoopNode(
+              `Loop node '${node.id}' iteration ${String(i)}: its output_format schema cannot be compiled (${schemaCompileError}), so its declared contract cannot be enforced. Fix the schema.`,
+              {
+                output: lastIterationOutput,
+                costUsd: loopTotalCostUsd,
+                ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+                loopIterations: i,
+                data: { iteration: i },
+              }
             );
           }
           if (validation.valid) {
@@ -7795,28 +7801,23 @@ async function executeWorkflowNode(
       const validation = validateStructuredOutput(logicalValue, node.output_format, compileMsg => {
         schemaCompileError = compileMsg;
       });
-      if (schemaCompileError === undefined) {
-        schemaCompiled = true;
-        certifiedLogicalValue = logicalValue;
-      } else {
-        // Fail-safe on an uncompilable schema, same contract as the AI-node gate:
-        // surface it loudly but never turn it into a spurious node failure.
+      if (schemaCompileError !== undefined) {
+        // An uncompilable schema fails the node (#2453), same contract as the
+        // AI-node gate: the loader compiles every declared `output_format`, so a
+        // refusal here means an unenforceable contract would otherwise certify the
+        // child's value by doing nothing.
         getLog().warn(
           { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
           'workflow.subrun_schema_uncompilable'
         );
-        void safeSendMessage(
-          platform,
-          conversationId,
-          `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so the sub-run '${node.workflow}' output was NOT validated against it. Fix the schema to enforce it.`,
-          msgContext
-        ).catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: parentRun.id, nodeId: node.id },
-            'workflow.subrun_schema_warn_send_failed'
-          );
-        });
+        return failResult(
+          `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), so the sub-run '${node.workflow}' output cannot be validated against it. Fix the schema.`,
+          outcome.costUsd,
+          outcome.tokens
+        );
       }
+      schemaCompiled = true;
+      certifiedLogicalValue = logicalValue;
       if (!validation.valid) {
         const errors = (validation.errors ?? ['value does not match the declared schema']).join(
           '; '
@@ -8846,8 +8847,8 @@ async function executeFanOutWorkflowNode(
   // match it — the join aggregates children, so one invalid element would otherwise be
   // persisted inside a "completed" node_completed row. Fails the node BEFORE any
   // writeCompleted so resume re-runs into the same named failure. An uncompilable
-  // schema warn-skips like the 1:1 gate; failed/paused/cancelled children are not
-  // validated (they never contribute a payload element).
+  // schema fails the node like the 1:1 gate (#2453); failed/paused/cancelled children
+  // are not validated (they never contribute a payload element).
   if (node.output_format) {
     for (const [index, outcome] of outcomes.entries()) {
       if (outcome.status !== 'completed') continue;
@@ -8861,10 +8862,11 @@ async function executeFanOutWorkflowNode(
           { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
           'workflow.subrun_schema_uncompilable'
         );
-        await notify(
-          `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so fan-out child ${String(index)} of '${node.workflow}' was NOT validated against it. Fix the schema to enforce it.`
-        );
-        continue;
+        const msg =
+          `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), ` +
+          `so fan-out child ${String(index)} of '${node.workflow}' cannot be validated against it. Fix the schema.`;
+        await notify(`❌ **Fan-out output_format uncompilable** (node \`${node.id}\`): ${msg}`);
+        return failResult(msg, totalCostUsd, totalTokens);
       }
       if (!validation.valid) {
         const errors = (validation.errors ?? ['value does not match the declared schema']).join(

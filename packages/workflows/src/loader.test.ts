@@ -8536,3 +8536,100 @@ nodes:
     ).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Declared contract schemas compile at load time (#2453)
+// ---------------------------------------------------------------------------
+
+describe('output_format compiles at load time (#2453)', () => {
+  it('rejects an output_format ajv cannot compile, naming the node', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: broken-contract
+description: declares a contract that can never be enforced
+nodes:
+  - id: plan
+    prompt: emit the plan result
+    output_format:
+      type: object
+      properties:
+        ready:
+          $ref: "#/$defs/missing"
+`,
+      'broken-contract.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toContain("Node 'plan' declares an output_format that cannot be compiled");
+    expect(error?.error).toContain('missing');
+  });
+
+  it('rejects an uncompilable output_format on a loop_group body node', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: broken-body-contract
+description: a body node runs its own turn, so its schema must compile too
+nodes:
+  - id: refine
+    loop_group:
+      max_iterations: 2
+      until: "$check.output.done == true"
+      nodes:
+        - id: check
+          prompt: judge the work
+          output_format:
+            type: object
+            properties:
+              done:
+                $ref: "#/$defs/nope"
+`,
+      'broken-body-contract.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain(
+      "Node 'check' declares an output_format that cannot be compiled"
+    );
+  });
+
+  it('still loads a schema carrying tolerated annotations and unknown formats', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: annotated-contract
+description: ajv stays strict:false, so annotations are not errors
+nodes:
+  - id: plan
+    prompt: emit the plan result
+    output_format:
+      type: object
+      title: Plan result
+      x-archon-note: an annotation ajv does not know
+      properties:
+        ready: { type: boolean }
+        when: { type: string, format: not-a-known-format }
+      required: [ready]
+`,
+      'annotated-contract.yaml'
+    );
+
+    expect(error).toBeNull();
+    expect(workflow?.nodes[0].output_format).toBeDefined();
+  });
+
+  it('leaves a schemaless node untouched', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: schemaless
+description: no declared contract, nothing to compile
+nodes:
+  - id: run
+    bash: echo hi
+`,
+      'schemaless.yaml'
+    );
+
+    expect(error).toBeNull();
+    expect(workflow?.nodes[0].output_format).toBeUndefined();
+  });
+});

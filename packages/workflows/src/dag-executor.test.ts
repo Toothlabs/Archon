@@ -13754,6 +13754,69 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     }
   });
 
+  it('loop output_format that ajv cannot compile fails the iteration (#2453)', async () => {
+    // Same contract as the ordinary AI gate: an unenforceable schema is a failure,
+    // not a warning that lets the iteration payload through unchecked.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: '{"done":true}' };
+      yield { type: 'result', sessionId: 's', structuredOutput: { done: true } };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'loop-uncompilable-schema',
+        nodes: [
+          {
+            id: 'implement',
+            kind: 'loop',
+            output_format: {
+              type: 'object',
+              properties: { done: { type: 'boolean' }, detail: { $ref: '#/$defs/missing' } },
+              required: ['done'],
+            },
+            loop: {
+              fresh_context: false,
+              prompt: 'Implement the change.',
+              max_iterations: 2,
+              until_field: 'done',
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+        (call[0] as Record<string, unknown>).step_name === 'implement'
+    );
+    expect(failed).toBeDefined();
+    expect(
+      String(((failed![0] as Record<string, unknown>).data as Record<string, unknown>).error)
+    ).toContain('output_format schema cannot be compiled');
+    // One iteration only: an unenforceable contract does not get retried.
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+  });
+
   it('output_format set but provider returns no structured output → node_failed (Task 8 fail-fast)', async () => {
     // Provider replied with prose only; no structuredOutput on the result chunk.
     mockSendQueryDag.mockImplementation(async function* () {
@@ -13860,6 +13923,67 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     const errMsg = ((failed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
       .error as string;
     expect(errMsg).toContain('failed schema validation');
+  });
+
+  it('output_format that ajv cannot compile → node_failed, never an unenforced pass (#2453)', async () => {
+    // The provider returned a perfectly shaped object. It still fails: the schema
+    // is uncompilable, so "valid" here would only mean nothing was checked. The
+    // loader rejects this file up front — this gate covers a definition that
+    // reached the executor without it.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: '{"verdict":"ship"}' };
+      yield { type: 'result', sessionId: 's', structuredOutput: { verdict: 'ship' } };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'outfmt-uncompilable',
+        nodes: [
+          {
+            id: 'classify',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'classify it' },
+            output_format: {
+              type: 'object',
+              properties: { verdict: { $ref: '#/$defs/missing' } },
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const eventTypes = eventCalls.map(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type
+    );
+    expect(eventTypes).not.toContain('node_completed');
+    const failed = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(failed.length).toBeGreaterThan(0);
+    const errMsg = ((failed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
+      .error as string;
+    expect(errMsg).toContain("Node 'classify'");
+    expect(errMsg).toContain('output_format schema cannot be compiled');
   });
 
   it('when: referencing a field not in the producer schema FAILS the node (not a silent skip)', async () => {
@@ -28775,18 +28899,27 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
       expect(eventTypes(store)).not.toContain('node_failed');
     });
 
-    it('warns instead of failing on an uncompilable schema', async () => {
+    it('fails the node on an uncompilable schema (#2453)', async () => {
+      // The loader rejects this schema before a run starts; reaching the boundary
+      // means the definition bypassed it, and a contract nobody can enforce must
+      // not certify the child's value by doing nothing.
       const store = setupCompletedChild({ summary_value: { verdict: 'SHIP' } });
 
-      const platform = await runSubNode(store, {
+      await runSubNode(store, {
         type: 'object',
         properties: { verdict: { $ref: '#/definitions/missing' } },
       });
 
-      expect(eventTypes(store)).toContain('node_completed');
-      expect(eventTypes(store)).not.toContain('node_failed');
-      const sent = platform.sendMessage.mock.calls.map(([, message]) => message);
-      expect(sent.some(m => m.includes('could not be compiled'))).toBe(true);
+      expect(eventTypes(store)).toContain('node_failed');
+      expect(eventTypes(store)).not.toContain('node_completed');
+      const failed = (
+        store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
+      ).mock.calls
+        .map((c: unknown[]) => c[0] as { event_type: string; data: { error: string } })
+        .filter(c => c.event_type === 'node_failed');
+      expect(failed.length).toBeGreaterThan(0);
+      expect(failed[0].data.error).toContain("Node 'sub'");
+      expect(failed[0].data.error).toContain('output_format schema cannot be compiled');
     });
   });
 

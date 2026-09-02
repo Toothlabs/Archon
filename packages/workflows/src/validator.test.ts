@@ -1387,3 +1387,45 @@ describe('validateWorkflowResources — skills search roots', () => {
     expect(missingSkillIssues(issues)).toHaveLength(1);
   });
 });
+
+// =============================================================================
+// validateWorkflowResources — declared contract compiles (#2453)
+// =============================================================================
+
+describe('validateWorkflowResources — output_format compiles', () => {
+  test('error when a declared output_format cannot be compiled', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'plan',
+        kind: 'agent',
+        source: { kind: 'prompt', text: 'emit the plan result' },
+        output_format: { type: 'object', properties: { ready: { $ref: '#/$defs/missing' } } },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const errors = issues.filter(i => i.field === 'output_format');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].level).toBe('error');
+    expect(errors[0].nodeId).toBe('plan');
+    expect(errors[0].message).toContain('cannot be compiled');
+  });
+
+  test('no issue for a compilable schema', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'plan',
+        kind: 'agent',
+        source: { kind: 'prompt', text: 'emit the plan result' },
+        output_format: {
+          type: 'object',
+          properties: { ready: { type: 'boolean' } },
+          required: ['ready'],
+        },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(issues.filter(i => i.field === 'output_format')).toHaveLength(0);
+  });
+});

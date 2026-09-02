@@ -26,6 +26,7 @@ import { isValidCommandName } from './command-validation';
 import { levenshtein, findSimilar } from './utils/fuzzy-match';
 import {
   claudeSkillSearchRoots,
+  compileOutputSchema,
   findInstalledSkillNames,
   getProviderCapabilities,
   isRegisteredProvider,
@@ -464,6 +465,25 @@ export async function validateWorkflowResources(
     // runs parseWorkflow, not this resource pass). Kept so a future raw caller can't
     // crash here.
     if (isIncludeDirective(node)) continue;
+
+    // --- Declared contract compiles (#2453) ---
+    // parseWorkflow already rejects an uncompilable `output_format`, so a file-fed
+    // caller never reaches this branch. It is kept for the callers that hand this
+    // pass a definition built in memory (tests, and any future synthesized or
+    // programmatically-assembled workflow), which would otherwise validate clean
+    // and then fail at the node boundary after the spend.
+    if (node.output_format !== undefined) {
+      const compileError = compileOutputSchema(node.output_format);
+      if (compileError !== null) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'output_format',
+          message: `Node '${node.id}' declares an output_format that cannot be compiled: ${compileError}`,
+          hint: 'Fix the JSON Schema — a declared contract is enforced against the node output, so it cannot be skipped.',
+        });
+      }
+    }
 
     const provider = resolveValidationProvider(
       node,
